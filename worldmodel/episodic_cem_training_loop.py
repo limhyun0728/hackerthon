@@ -93,8 +93,11 @@ from hackerthon.worldmodel.train_object_centric_jepa import (  # noqa: E402
 )
 
 
-BLUE_POSITIONS = tuple((101 + index, -8.0, y, 0.0) for index, y in enumerate((-6.0, -3.0, 0.0, 3.0, 6.0)))
-RED_POSITIONS = tuple((201 + index, 9.0, y, 180.0) for index, y in enumerate((-6.0, -3.0, 0.0, 3.0, 6.0)))
+DEFAULT_OBJECTIVE = CURRENT_OBJECTIVE
+DEFAULT_BLUE_POSITIONS = tuple((101 + index, -8.0, y, 0.0) for index, y in enumerate((-6.0, -3.0, 0.0, 3.0, 6.0)))
+DEFAULT_RED_POSITIONS = tuple((201 + index, 9.0, y, 180.0) for index, y in enumerate((-6.0, -3.0, 0.0, 3.0, 6.0)))
+BLUE_POSITIONS = DEFAULT_BLUE_POSITIONS
+RED_POSITIONS = DEFAULT_RED_POSITIONS
 BLUE_IDS = tuple(position[0] for position in BLUE_POSITIONS)
 RED_IDS = tuple(position[0] for position in RED_POSITIONS)
 ALL_UNIT_IDS = BLUE_IDS + RED_IDS
@@ -108,6 +111,145 @@ def _load_obstacle_config(path: Path) -> tuple[dict[str, object], tuple[tuple[fl
         for rect in config["obstacles"]
     )
     return config, obstacles
+
+
+def _even_lanes(count: int, *, y_min: float = -6.0, y_max: float = 6.0) -> tuple[float, ...]:
+    """기존 5v5 배치 스타일을 team size에 맞춰 균등 확장한다."""
+    if count <= 0:
+        raise ValueError("team size는 0보다 커야 한다")
+    if count == 1:
+        return (0.0,)
+    return tuple(y_min + (y_max - y_min) * index / (count - 1) for index in range(count))
+
+
+def _make_default_positions(team_size: int) -> tuple[
+    tuple[tuple[int, float, float, float], ...],
+    tuple[tuple[int, float, float, float], ...],
+]:
+    """config 배치가 없을 때 쓰는 기본 동서 대치 배치."""
+    lanes = _even_lanes(team_size)
+    blue = tuple((101 + index, -8.0, y, 0.0) for index, y in enumerate(lanes))
+    red = tuple((201 + index, 9.0, y, 180.0) for index, y in enumerate(lanes))
+    return blue, red
+
+
+def _position_from_mapping(entry: Mapping[str, object], *, default_id: int) -> tuple[int, float, float, float]:
+    """config의 unit position row를 내부 tuple로 변환한다."""
+    unit_id = int(entry.get("id", default_id))
+    return (
+        unit_id,
+        float(entry["x"]),
+        float(entry["y"]),
+        float(entry.get("heading", 0.0)),
+    )
+
+
+def _positions_from_config(config: Mapping[str, object] | None, team: str) -> tuple[tuple[int, float, float, float], ...] | None:
+    """obstacle config의 initial_positions.blue/red를 읽는다."""
+    if not config:
+        return None
+    initial = config.get("initial_positions")
+    if not isinstance(initial, Mapping):
+        return None
+    raw_positions = initial.get(team)
+    if raw_positions is None:
+        return None
+    if not isinstance(raw_positions, Sequence) or isinstance(raw_positions, (str, bytes)):
+        raise ValueError(f"initial_positions.{team}은 list여야 한다")
+
+    base_id = 101 if team == "blue" else 201
+    positions: list[tuple[int, float, float, float]] = []
+    for index, entry in enumerate(raw_positions):
+        if isinstance(entry, Mapping):
+            positions.append(_position_from_mapping(entry, default_id=base_id + index))
+        elif isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)) and len(entry) >= 4:
+            positions.append((int(entry[0]), float(entry[1]), float(entry[2]), float(entry[3])))
+        else:
+            raise ValueError(f"initial_positions.{team}[{index}] 형식이 잘못됐다: {entry!r}")
+    return tuple(positions)
+
+
+def _positions_to_config() -> dict[str, list[dict[str, float | int]]]:
+    """현재 module-level force layout을 config에 기록 가능한 형태로 만든다."""
+    return {
+        "blue": [
+            {"id": unit_id, "x": x, "y": y, "heading": heading}
+            for unit_id, x, y, heading in BLUE_POSITIONS
+        ],
+        "red": [
+            {"id": unit_id, "x": x, "y": y, "heading": heading}
+            for unit_id, x, y, heading in RED_POSITIONS
+        ],
+    }
+
+
+def _configured_team_size(
+    *,
+    requested_team_size: int | None,
+    obstacle_config: Mapping[str, object] | None,
+) -> int:
+    """CLI team size와 config initial_positions를 합쳐 최종 team size를 정한다."""
+    if requested_team_size is not None:
+        if requested_team_size <= 0:
+            raise ValueError("--team-size는 0보다 커야 한다")
+        return int(requested_team_size)
+    blue = _positions_from_config(obstacle_config, "blue")
+    red = _positions_from_config(obstacle_config, "red")
+    if blue is not None or red is not None:
+        if blue is None or red is None or len(blue) != len(red):
+            raise ValueError("initial_positions는 blue/red를 같은 개수로 모두 제공해야 한다")
+        return len(blue)
+    return len(DEFAULT_BLUE_POSITIONS)
+
+
+def _configure_force_layout(
+    *,
+    team_size: int,
+    obstacle_config: Mapping[str, object] | None,
+    objective: tuple[float, float],
+) -> None:
+    """episode 실행 전에 module-level BLUE/RED layout과 objective를 설정한다."""
+    global BLUE_POSITIONS, RED_POSITIONS, BLUE_IDS, RED_IDS, ALL_UNIT_IDS, CURRENT_OBJECTIVE
+
+    configured_blue = _positions_from_config(obstacle_config, "blue")
+    configured_red = _positions_from_config(obstacle_config, "red")
+    if configured_blue is not None or configured_red is not None:
+        if configured_blue is None or configured_red is None:
+            raise ValueError("initial_positions는 blue/red를 모두 제공해야 한다")
+        if len(configured_blue) != team_size or len(configured_red) != team_size:
+            raise ValueError(
+                "initial_positions 개수와 --team-size가 다르다: "
+                f"blue={len(configured_blue)} red={len(configured_red)} team_size={team_size}"
+            )
+        BLUE_POSITIONS = configured_blue
+        RED_POSITIONS = configured_red
+    else:
+        BLUE_POSITIONS, RED_POSITIONS = _make_default_positions(team_size)
+
+    BLUE_IDS = tuple(position[0] for position in BLUE_POSITIONS)
+    RED_IDS = tuple(position[0] for position in RED_POSITIONS)
+    if len(set(BLUE_IDS + RED_IDS)) != len(BLUE_IDS) + len(RED_IDS):
+        raise ValueError("BLUE/RED unit id가 중복됐다")
+    ALL_UNIT_IDS = BLUE_IDS + RED_IDS
+    CURRENT_OBJECTIVE = (float(objective[0]), float(objective[1]))
+
+
+def _objective_from_args(
+    *,
+    objective_x: float | None,
+    objective_y: float | None,
+    obstacle_config: Mapping[str, object] | None,
+) -> tuple[float, float]:
+    """CLI 또는 obstacle config에서 objective를 결정한다."""
+    if (objective_x is None) != (objective_y is None):
+        raise ValueError("--objective-x와 --objective-y는 함께 지정해야 한다")
+    if objective_x is not None and objective_y is not None:
+        return (float(objective_x), float(objective_y))
+    if obstacle_config and isinstance(obstacle_config.get("objective"), Sequence):
+        objective = obstacle_config["objective"]
+        if not isinstance(objective, (str, bytes)) and len(objective) >= 2:
+            return (float(objective[0]), float(objective[1]))
+    return DEFAULT_OBJECTIVE
 
 
 @dataclass(frozen=True)
@@ -395,32 +537,44 @@ def _any_blue_alive(rows: Sequence[Mapping[str, object]]) -> bool:
     return any(float(row["hp"]) > 0.0 for row in blue_rows)
 
 
-def _objective_reached(rows: Sequence[Mapping[str, object]]) -> bool:
+def _objective_reached(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    objective: tuple[float, float] = CURRENT_OBJECTIVE,
+) -> bool:
     """살아 있는 BLUE가 objective 반경에 들어왔는지 본다."""
     for row in rows:
         if int(row["id"]) not in BLUE_IDS:
             continue
         if float(row["hp"]) <= 0.0:
             continue
-        distance = math.hypot(float(row["x"]) - CURRENT_OBJECTIVE[0], float(row["y"]) - CURRENT_OBJECTIVE[1])
+        distance = math.hypot(float(row["x"]) - objective[0], float(row["y"]) - objective[1])
         if distance <= OBJECTIVE_RADIUS:
             return True
     return False
 
 
-def determine_outcome(rows: Sequence[Mapping[str, object]]) -> str:
+def determine_outcome(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    objective: tuple[float, float] = CURRENT_OBJECTIVE,
+) -> str:
     """episode 종료 state로 승패/시간초과를 판정한다."""
-    if _all_red_destroyed(rows) and _objective_reached(rows):
+    if _all_red_destroyed(rows) and _objective_reached(rows, objective=objective):
         return "WIN"
     if not _any_blue_alive(rows):
         return "LOSE"
     return "TIMEOUT"
 
 
-def _objective_distance(rows: Sequence[Mapping[str, object]]) -> float:
+def _objective_distance(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    objective: tuple[float, float] = CURRENT_OBJECTIVE,
+) -> float:
     """살아 있는 BLUE 중 objective에 가장 가까운 거리를 계산한다."""
     distances = [
-        math.hypot(float(row["x"]) - CURRENT_OBJECTIVE[0], float(row["y"]) - CURRENT_OBJECTIVE[1])
+        math.hypot(float(row["x"]) - objective[0], float(row["y"]) - objective[1])
         for row in rows
         if int(row["id"]) in BLUE_IDS and float(row["hp"]) > 0.0
     ]
@@ -429,7 +583,7 @@ def _objective_distance(rows: Sequence[Mapping[str, object]]) -> float:
     return min(distances)
 
 
-def _episode_summary(result: EpisodeResult) -> dict[str, object]:
+def _episode_summary(result: EpisodeResult, *, objective: tuple[float, float]) -> dict[str, object]:
     """긴 tick CSV 없이 학습 진행 판단에 필요한 episode 요약만 만든다."""
     blue_rows = [row for row in result.final_rows if int(row["id"]) in BLUE_IDS]
     red_rows = [row for row in result.final_rows if int(row["id"]) in RED_IDS]
@@ -445,18 +599,18 @@ def _episode_summary(result: EpisodeResult) -> dict[str, object]:
         "red_alive": sum(float(row["hp"]) > 0.0 for row in red_rows),
         "blue_hp": sum(max(float(row["hp"]), 0.0) for row in blue_rows),
         "red_hp": sum(max(float(row["hp"]), 0.0) for row in red_rows),
-        "objective_distance": _objective_distance(result.final_rows),
+        "objective_distance": _objective_distance(result.final_rows, objective=objective),
         "states": len(result.trajectory.states),
         "actions": len(result.trajectory.actions),
         "rollout_windows": len(result.rollout_windows),
     }
 
 
-def _append_episode_summary(output_root: Path, result: EpisodeResult) -> None:
+def _append_episode_summary(output_root: Path, result: EpisodeResult, *, objective: tuple[float, float]) -> None:
     """장기 학습용으로 episode 최종 요약만 JSONL에 누적 저장한다."""
     output_root.mkdir(parents=True, exist_ok=True)
     with (output_root / "episode_summary.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(_episode_summary(result), ensure_ascii=False) + "\n")
+        handle.write(json.dumps(_episode_summary(result, objective=objective), ensure_ascii=False) + "\n")
 
 
 def _append_validation_summary(output_root: Path, row: Mapping[str, object]) -> None:
@@ -629,6 +783,7 @@ class CEMCommanderAtomic(AtomicDEVS):
         policy_prior_mix: float = 0.25,
         red_target_priority: str = "nearest",
         write_csv_logs: bool = True,
+        objective: tuple[float, float] = CURRENT_OBJECTIVE,
         dt: float = 1.0,
     ):
         super().__init__("CEMCommander")
@@ -650,6 +805,7 @@ class CEMCommanderAtomic(AtomicDEVS):
         self.model_config = model_config
         self.cem_config = cem_config
         self.device = device
+        self.objective = (float(objective[0]), float(objective[1]))
         if rollout_backend not in ("jepa", "devs"):
             raise ValueError("rollout_backend는 jepa 또는 devs여야 한다")
         self.rollout_backend = rollout_backend
@@ -798,6 +954,7 @@ class CEMCommanderAtomic(AtomicDEVS):
                 obstacles=self.obstacles,
                 time_sec=status_time,
                 duration_sec=self.duration_sec,
+                objective=self.objective,
             )
             self._latest_state_time = status_time
 
@@ -1353,7 +1510,7 @@ class CEMCommanderAtomic(AtomicDEVS):
 
 
 class CEMEpisodeBattleModel(CoupledDEVS):
-    """CEM commander를 붙인 v2 5v5 DEVS battle model."""
+    """CEM commander를 붙인 v2 DEVS battle model."""
 
     def __init__(
         self,
@@ -1372,6 +1529,7 @@ class CEMEpisodeBattleModel(CoupledDEVS):
         policy_prior_mix: float = 0.25,
         red_target_priority: str = "nearest",
         write_csv_logs: bool = True,
+        objective: tuple[float, float] = CURRENT_OBJECTIVE,
     ):
         super().__init__("CEMEpisodeBattleModel")
         random.seed(seed)
@@ -1415,6 +1573,7 @@ class CEMEpisodeBattleModel(CoupledDEVS):
                 policy_prior_mix=policy_prior_mix,
                 red_target_priority=red_target_priority,
                 write_csv_logs=self.write_csv_logs,
+                objective=objective,
             )
         )
 
@@ -1487,6 +1646,7 @@ def _write_episode_config(
     write_csv_logs: bool,
     model_config: ObjectSlotModelConfig,
     cem_config: CEMConfig,
+    objective: tuple[float, float],
     obstacle_config: Mapping[str, object] | None = None,
     obstacle_config_source: Path | None = None,
 ) -> None:
@@ -1500,9 +1660,11 @@ def _write_episode_config(
         "red_target_priority": red_target_priority,
         "write_csv_logs": bool(write_csv_logs),
         "obstacles": [list(rect) for rect in obstacles],
-        "objective": list(CURRENT_OBJECTIVE),
+        "objective": [float(objective[0]), float(objective[1])],
+        "team_size": len(BLUE_IDS),
         "blue_ids": list(BLUE_IDS),
         "red_ids": list(RED_IDS),
+        "initial_positions": _positions_to_config(),
         "model_config": {
             key: value for key, value in model_config.__dict__.items()
         },
@@ -1538,6 +1700,7 @@ def run_episode(
     write_csv_logs: bool = True,
     obstacle_config: Mapping[str, object] | None = None,
     obstacle_config_source: Path | None = None,
+    objective: tuple[float, float] = CURRENT_OBJECTIVE,
 ) -> EpisodeResult:
     """DEVS episode를 새로 실행하고 CEM trajectory를 반환한다."""
     run_dir = output_root / f"episode_{episode_index:04d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1553,6 +1716,7 @@ def run_episode(
         write_csv_logs=write_csv_logs,
         model_config=model_config,
         cem_config=cem_config,
+        objective=objective,
         obstacle_config=obstacle_config,
         obstacle_config_source=obstacle_config_source,
     )
@@ -1572,12 +1736,13 @@ def run_episode(
         policy_prior_mix=policy_prior_mix,
         red_target_priority=red_target_priority,
         write_csv_logs=write_csv_logs,
+        objective=objective,
     )
     simulator = Simulator(battle)
     simulator.setTerminationTime(duration_sec)
     simulator.simulate()
     latest_rows = battle.commander.latest_rows()
-    outcome = determine_outcome(latest_rows)
+    outcome = determine_outcome(latest_rows, objective=objective)
     trajectory = battle.commander.trajectory(episode_id=run_dir.name, outcome=outcome)
     battle.commander.close()
     return EpisodeResult(
@@ -1605,6 +1770,24 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="config.json의 obstacles를 실제 장애물 지형으로 사용한다. 지정하면 --terrain보다 우선한다.",
+    )
+    parser.add_argument(
+        "--team-size",
+        type=int,
+        default=None,
+        help="팀별 유닛 수. obstacle config에 initial_positions가 있으면 생략 가능하다.",
+    )
+    parser.add_argument(
+        "--objective-x",
+        type=float,
+        default=None,
+        help="기존 미션의 도달 objective x좌표. 생략하면 obstacle config 또는 기본값을 쓴다.",
+    )
+    parser.add_argument(
+        "--objective-y",
+        type=float,
+        default=None,
+        help="기존 미션의 도달 objective y좌표. 생략하면 obstacle config 또는 기본값을 쓴다.",
     )
     parser.add_argument(
         "--cem-rollout",
@@ -1859,6 +2042,24 @@ def main(argv: Iterable[str] | None = None) -> None:
         if not args.obstacle_config.exists():
             raise FileNotFoundError(f"obstacle config가 없다: {args.obstacle_config}")
         obstacle_config, configured_obstacles = _load_obstacle_config(args.obstacle_config)
+    team_size = _configured_team_size(
+        requested_team_size=args.team_size,
+        obstacle_config=obstacle_config,
+    )
+    objective = _objective_from_args(
+        objective_x=args.objective_x,
+        objective_y=args.objective_y,
+        obstacle_config=obstacle_config,
+    )
+    _configure_force_layout(
+        team_size=team_size,
+        obstacle_config=obstacle_config,
+        objective=objective,
+    )
+    print(
+        "force layout: "
+        f"{len(BLUE_IDS)}v{len(RED_IDS)} objective=({CURRENT_OBJECTIVE[0]:.2f},{CURRENT_OBJECTIVE[1]:.2f})"
+    )
 
     device = torch.device(args.device)
     model_config = ObjectSlotModelConfig(
@@ -2164,6 +2365,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             write_csv_logs=not args.disable_csv_logs,
             obstacle_config=obstacle_config,
             obstacle_config_source=args.obstacle_config,
+            objective=CURRENT_OBJECTIVE,
         )
         windows = build_training_windows_from_episode(
             result.trajectory,
@@ -2186,7 +2388,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             f"windows={len(windows)} rollout_windows={len(result.rollout_windows)} "
             f"run_dir={result.run_dir}{rollout_text}{policy_schedule_text}"
         )
-        _append_episode_summary(args.output_root, result)
+        _append_episode_summary(args.output_root, result, objective=CURRENT_OBJECTIVE)
         train_metrics = ()
         if args.freeze_world_model:
             # policy head는 CEM이 실제 실행한 trajectory로 학습하지만, 이미 검증된
