@@ -906,7 +906,11 @@ class JointActionConditioner(nn.Module):
                     raise ValueError(f"같은 batch에서 unit {unit_id} action이 중복됐다")
                 seen_unit_ids.add(unit_id)
 
-                matched = torch.nonzero(entity_ids[batch_index] == unit_id, as_tuple=False).flatten()
+                matched = torch.nonzero(
+                    (entity_ids[batch_index] == unit_id)
+                    & (type_ids[batch_index] == int(ObjectType.UNIT)),
+                    as_tuple=False,
+                ).flatten()
                 if matched.numel() != 1:
                     raise ValueError(f"action 대상 unit {unit_id}에 해당하는 slot이 정확히 하나여야 한다")
                 slot_index = int(matched[0].detach().cpu().item())

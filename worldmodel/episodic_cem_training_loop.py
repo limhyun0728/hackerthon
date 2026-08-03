@@ -490,7 +490,9 @@ def _slot_unit_rows(slot_batch: SlotBatch) -> list[dict[str, object]]:
         unit_id = int(entity_id)
         if unit_id <= 0:
             continue
-        if unit_id < 100:
+        # id 범위가 아니라 slot type으로 거른다. terrain slot을 유닛으로 읽으면
+        # feature 3/4번(폭·높이)을 x/y로 해석해 엉뚱한 좌표가 나온다.
+        if int(slot_batch.type_ids[index]) != int(ObjectType.UNIT):
             continue
         hp_ratio = float(slot_batch.features[index, 1])
         ammo_ratio = float(slot_batch.features[index, 2])

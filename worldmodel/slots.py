@@ -49,6 +49,13 @@ OBJECTIVE_RADIUS = 1.0
 MAX_HP = 100.0
 MAX_AMMO = 30.0
 
+# terrain slot의 entity_id 전용 번호대. 유닛 id(101~, 201~)와 절대 겹치지 않게
+# 별도 대역을 쓴다. 장애물 개수가 100을 넘으면 1부터 세는 순번이 BLUE id를
+# 덮어써서 플래너가 건물의 폭/높이를 유닛 좌표로 읽는 사고가 난다.
+TERRAIN_ENTITY_ID_BASE = 10_000
+# unit id가 이 값 이상이면 terrain 대역을 침범한다.
+MAX_UNIT_ENTITY_ID = TERRAIN_ENTITY_ID_BASE - 1
+
 UNIT_FEATURE_NAMES = (
     "team",
     "hp_ratio",
@@ -199,7 +206,12 @@ def unit_feature_from_row(row: Mapping[str, str]) -> tuple[np.ndarray, np.ndarra
 
 
 def terrain_feature_from_rect(index: int, rect: Sequence[float]) -> tuple[np.ndarray, np.ndarray, int]:
-    """AABB 장애물을 terrain slot feature로 변환한다."""
+    """AABB 장애물을 terrain slot feature로 변환한다.
+
+    entity_id는 TERRAIN_ENTITY_ID_BASE + index로 매겨 유닛 id와 대역을 분리한다.
+    """
+    if index < 1:
+        raise ValueError("terrain index는 1부터 시작해야 한다")
     if len(rect) != 4:
         raise ValueError("terrain rect는 xmin, ymin, xmax, ymax 네 값이어야 한다")
     xmin, ymin, xmax, ymax = map(float, rect)
@@ -224,7 +236,7 @@ def terrain_feature_from_rect(index: int, rect: Sequence[float]) -> tuple[np.nda
         1.0,  # los_block
     )
     features, mask = _padded(vector)
-    return features, mask, int(index)
+    return features, mask, TERRAIN_ENTITY_ID_BASE + int(index)
 
 
 def mission_feature(
@@ -280,6 +292,10 @@ def build_slot_batch(
 
     for row in sorted(unit_rows, key=lambda item: int(item["id"])):
         unit_features, unit_mask, unit_id, team, alive = unit_feature_from_row(row)
+        if unit_id > MAX_UNIT_ENTITY_ID:
+            raise ValueError(
+                f"unit id {unit_id}가 terrain 전용 대역({TERRAIN_ENTITY_ID_BASE} 이상)을 침범한다"
+            )
         features.append(unit_features)
         masks.append(unit_mask)
         type_ids.append(int(ObjectType.UNIT))
@@ -296,7 +312,7 @@ def build_slot_batch(
         entity_ids.append(terrain_id)
         team_ids.append(int(TeamId.NONE))
         alive_mask.append(True)
-        names.append(f"T{terrain_id:03d}")
+        names.append(f"T{index:03d}")
 
     mission_features, mission_mask = mission_feature(
         time_sec=time_sec,
