@@ -1,0 +1,48 @@
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.local
+
+# Generated simulation/map artifacts
+output/
+frames/
+*.mp4
+*.avi
+*.mov
+*.webm
+
+# Generated images from map/video rendering
+*.png
+*.jpg
+*.jpeg
+
+# Model checkpoints and large experiment artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Archived snapshots / external data bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
