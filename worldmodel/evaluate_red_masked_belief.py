@@ -41,7 +41,12 @@ from hackerthon.worldmodel.cem_planner import (
 from hackerthon.worldmodel.devs_rollout import rollout_plans_with_devs, snapshot_from_slot_rows
 from hackerthon.worldmodel.measure_rank_correlation import spearman, top_k_recall
 from hackerthon.worldmodel.object_slot_attention import DEVSObjectCentricWorldModel, ObjectSlotModelConfig
-from hackerthon.worldmodel.slots import MAX_FEATURE_DIM, SlotBatch, available_times
+from hackerthon.worldmodel.slots import (
+    MAX_FEATURE_DIM,
+    SlotBatch,
+    available_times,
+    objective_from_config,
+)
 from hackerthon.worldmodel.train_object_centric_jepa import TrainingWindow, collate_training_batch, load_training_window
 
 UNIT_HP_INDEX = 1
@@ -443,6 +448,7 @@ def _rank_metrics(
         obstacles=obstacles,
         base_time_sec=true_current_batch.time_sec,
         episode_duration_sec=duration_sec,
+        objective=objective_from_config(_load_config(loaded.spec.run_dir)),
     )
     devs_features = rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
     masked_features = _rollout_masked_world_model(

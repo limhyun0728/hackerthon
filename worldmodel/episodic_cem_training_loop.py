@@ -37,7 +37,20 @@ from pypdevs.simulator import Simulator  # noqa: E402
 from hackerthon.simulation_direct_commander_5v5 import CSVLoggerAtomic, RulePolicyAtomic  # noqa: E402
 from hackerthon.red_policy import UrbanRedPolicy  # noqa: E402
 from hackerthon.sim_units import LosSoldierAtomic, LosWorldAtomic  # noqa: E402
-from hackerthon.terrain import DEFAULT_OBSTACLES, clamp_to_world, has_los, next_waypoint  # noqa: E402
+from hackerthon.terrain import (  # noqa: E402
+    DEFAULT_OBSTACLES,
+    WORLD_X_MAX,
+    WORLD_X_MIN,
+    cell_of,
+    clamp_to_world,
+    component_points,
+    has_los,
+    largest_free_component,
+    next_waypoint,
+    path_pad_for_unit_radius,
+    set_path_pad,
+    snap_to_component,
+)
 from hackerthon.worldmodel.actions import (  # noqa: E402
     ActionBatch,
     ActionType,
@@ -71,11 +84,17 @@ from hackerthon.worldmodel.policy_head import (  # noqa: E402
 )
 from hackerthon.worldmodel.slots import (  # noqa: E402
     CURRENT_OBJECTIVE,
+    MISSION_DESTROY_AND_REACH,
+    MISSION_HOLD_OBJECTIVE,
+    MISSION_TYPE_BY_NAME,
+    MISSION_TYPE_NAMES,
+    MISSION_TYPES,
     OBJECTIVE_RADIUS,
     ObjectType,
     SlotBatch,
     TeamId,
     build_slot_batch,
+    mission_completed,
 )
 from hackerthon.worldmodel.train_object_centric_jepa import (  # noqa: E402
     EpisodeTrajectory,
@@ -560,13 +579,28 @@ def determine_outcome(
     rows: Sequence[Mapping[str, object]],
     *,
     objective: tuple[float, float] = CURRENT_OBJECTIVE,
+    mission_type: int = MISSION_DESTROY_AND_REACH,
+    time_sec: float | None = None,
+    duration_sec: float | None = None,
 ) -> str:
-    """episode 종료 state로 승패/시간초과를 판정한다."""
-    if _all_red_destroyed(rows) and _objective_reached(rows, objective=objective):
-        return "WIN"
-    if not _any_blue_alive(rows):
+    """episode 종료 state로 승패/시간초과를 판정한다.
+
+    성공 조건은 임무마다 다르다. mission_completed가 slot의 completion_flag와
+    같은 규칙을 쓰므로 학습 신호와 승패 판정이 어긋나지 않는다.
+    """
+    blue_alive = _any_blue_alive(rows)
+    if not blue_alive:
         return "LOSE"
-    return "TIMEOUT"
+    completed = mission_completed(
+        mission_type=mission_type,
+        red_alive=not _all_red_destroyed(rows),
+        blue_alive=blue_alive,
+        objective_reached=_objective_reached(rows, objective=objective),
+        # SURVIVE는 종료 시점에 살아 있으면 성공이다.
+        time_sec=float(duration_sec if time_sec is None else time_sec),
+        duration_sec=float(duration_sec if duration_sec is not None else 1.0),
+    )
+    return "WIN" if completed else "TIMEOUT"
 
 
 def _objective_distance(
@@ -786,6 +820,9 @@ class CEMCommanderAtomic(AtomicDEVS):
         red_target_priority: str = "nearest",
         write_csv_logs: bool = True,
         objective: tuple[float, float] = CURRENT_OBJECTIVE,
+        mission_type: int = MISSION_DESTROY_AND_REACH,
+        blue_controller: str = "cem",
+        blue_target_priority: str = "nearest",
         dt: float = 1.0,
     ):
         super().__init__("CEMCommander")
@@ -801,6 +838,8 @@ class CEMCommanderAtomic(AtomicDEVS):
         self.controlled_ids = tuple(int(unit_id) for unit_id in controlled_ids)
         self.all_unit_ids = tuple(int(unit_id) for unit_id in all_unit_ids)
         self.obstacles = tuple(tuple(float(value) for value in rect) for rect in obstacles)
+        # flood fill은 비싸므로 episode 동안 한 번만 계산한다.
+        self._free_component_cache: set | None = None
         self.duration_sec = float(duration_sec)
         self.run_dir = Path(run_dir)
         self.model = model
@@ -808,6 +847,11 @@ class CEMCommanderAtomic(AtomicDEVS):
         self.cem_config = cem_config
         self.device = device
         self.objective = (float(objective[0]), float(objective[1]))
+        self.mission_type = int(mission_type)
+        if blue_controller not in ("cem", "rule"):
+            raise ValueError("blue_controller는 cem 또는 rule이어야 한다")
+        self.blue_controller = blue_controller
+        self.blue_target_priority = blue_target_priority
         if rollout_backend not in ("jepa", "devs"):
             raise ValueError("rollout_backend는 jepa 또는 devs여야 한다")
         self.rollout_backend = rollout_backend
@@ -892,9 +936,17 @@ class CEMCommanderAtomic(AtomicDEVS):
         if not _alive_blue_ids_from_rows(current_rows):
             return {}
 
-        plan, selector, best_score, population_mean = self._select_plan(current_batch)
-        commands = self._commands_from_plan(plan, current_batch=current_batch, step_index=0)
-        self._record_commands(current_time, commands, selector=selector, best_score=best_score, population_mean=population_mean)
+        if self.blue_controller == "rule":
+            commands = self._blue_rule_commands(current_batch, time_sec=current_time)
+            self._record_commands(
+                current_time, commands, selector="blue_rule", best_score=0.0, population_mean=0.0
+            )
+        else:
+            plan, selector, best_score, population_mean = self._select_plan(current_batch)
+            commands = self._commands_from_plan(plan, current_batch=current_batch, step_index=0)
+            self._record_commands(
+                current_time, commands, selector=selector, best_score=best_score, population_mean=population_mean
+            )
 
         out = {}
         for command in commands:
@@ -957,6 +1009,7 @@ class CEMCommanderAtomic(AtomicDEVS):
                 time_sec=status_time,
                 duration_sec=self.duration_sec,
                 objective=self.objective,
+                mission_type=self.mission_type,
             )
             self._latest_state_time = status_time
 
@@ -1039,6 +1092,8 @@ class CEMCommanderAtomic(AtomicDEVS):
             obstacles=self.obstacles,
             base_time_sec=current_time,
             episode_duration_sec=self.duration_sec,
+            objective=self.objective,
+            mission_type=self.mission_type,
         )
         # tick마다 다른 seed, 같은 tick의 후보끼리는 같은 seed(common random numbers).
         # episode_seed를 섞어 episode 간에도 rollout 난수가 달라지게 한다.
@@ -1077,6 +1132,57 @@ class CEMCommanderAtomic(AtomicDEVS):
             time_sec=float(time_sec),
         )
 
+    def _blue_rule_commands(self, current_batch: SlotBatch, *, time_sec: float) -> list[dict[str, object]]:
+        """규칙 정책으로 BLUE 명령을 만든다. 월드모델 학습 데이터 수집용 경로다.
+
+        CEM은 6프레임 점수를 최적화하는 탐색기라, 집단 MOVE 신호에 개별 ENGAGE의
+        기여가 묻혀 교전이 거의 사라진다. 학습에 필요한 건 최적 전술이 아니라
+        교전을 포함한 다양한 전이이므로, 데이터 수집은 규칙 정책으로 한다.
+        RED와 같은 정책 클래스를 쓰되 표적 종류와 목표 지점만 바꾼다.
+        """
+        rows = _slot_unit_rows(current_batch)
+        row_by_id = {int(row["id"]): row for row in rows}
+        commands: list[dict[str, object]] = []
+        for blue_id in BLUE_IDS:
+            row = row_by_id[blue_id]
+            if float(row["hp"]) <= 0.0:
+                continue
+            observation = {
+                "time": float(time_sec),
+                "self": {
+                    "id": int(blue_id),
+                    "x": round(float(row["x"]), 3),
+                    "y": round(float(row["y"]), 3),
+                    "hp": float(row["hp"]),
+                    "ammo": int(row["ammo"]),
+                    "heading": round(float(row["heading"]), 2),
+                    "mode": str(row["mode"]),
+                },
+                "visible_entities": _visible_entities_for_unit(
+                    observer_row=row,
+                    rows=rows,
+                    obstacles=self.obstacles,
+                    fov_deg=120.0,
+                ),
+            }
+            command = dict(
+                UrbanRedPolicy(
+                    # BLUE 입장에서 표적은 RED("enemy")다.
+                    target_type="enemy",
+                    obstacles=self.obstacles,
+                    target_priority=self.blue_target_priority,
+                    lane_seed=self.episode_seed + 1,
+                    # 임무 목표로 향하게 한다. 임무마다 objective 위치가 다르므로
+                    # destroy 계열은 RED 진영으로, 거점 방어는 거점으로 전진한다.
+                    assault_target=self.objective,
+                ).decide(observation)
+            )
+            command["unit_id"] = int(blue_id)
+            command["time"] = float(time_sec)
+            command["duration_sec"] = float(command.get("duration_sec", 1.0))
+            commands.append(command)
+        return commands
+
     def _red_rule_action_batch(self, state_batch: SlotBatch, *, time_sec: float) -> ActionBatch:
         """현재/후보 state에서 RED rule을 평가해 RED action batch를 만든다."""
         rows = _slot_unit_rows(state_batch)
@@ -1110,6 +1216,8 @@ class CEMCommanderAtomic(AtomicDEVS):
                     target_type="soldier",
                     obstacles=self.obstacles,
                     target_priority=self.red_target_priority,
+                    lane_seed=self.episode_seed,
+                    assault_target=self._red_assault_target(),
                 ).decide(observation)
             )
             command["time"] = float(time_sec)
@@ -1367,6 +1475,18 @@ class CEMCommanderAtomic(AtomicDEVS):
             allow_extra_commands=True,
         )
 
+    def _red_assault_target(self) -> tuple[float, float] | None:
+        """BLUE 거점 방어 임무에서만 RED가 공격할 거점을 준다."""
+        if self.mission_type == MISSION_HOLD_OBJECTIVE:
+            return self.objective
+        return None
+
+    def _free_component(self) -> set:
+        """이 지형에서 이동 가능한 최대 영역. CEM 목적지 투영에 쓴다."""
+        if self._free_component_cache is None:
+            self._free_component_cache = largest_free_component(list(self.obstacles))
+        return self._free_component_cache
+
     def _commands_from_plan(
         self,
         plan,
@@ -1393,6 +1513,13 @@ class CEMCommanderAtomic(AtomicDEVS):
                 target_x, target_y = clamp_to_world(target_x, target_y)
                 current_pos = (float(row_by_id[unit_id]["x"]), float(row_by_id[unit_id]["y"]))
                 waypoint = next_waypoint(current_pos, (target_x, target_y), self.obstacles, max_step=1.5)
+                if waypoint is None:
+                    # CEM은 지형을 모른 채 목적지를 뽑으므로 건물 안이 나올 수 있다.
+                    # 그때 STOP시키면 유닛이 지형이 촘촘한 맵에서 계속 멈춘다.
+                    # 도달 가능한 최근접 지점으로 투영해 이동은 계속하게 한다.
+                    projected = snap_to_component((target_x, target_y), self._free_component())
+                    if projected is not None:
+                        waypoint = next_waypoint(current_pos, projected, self.obstacles, max_step=1.5)
                 if waypoint is None:
                     commands.append({"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": "cem move blocked"})
                 else:
@@ -1532,6 +1659,9 @@ class CEMEpisodeBattleModel(CoupledDEVS):
         red_target_priority: str = "nearest",
         write_csv_logs: bool = True,
         objective: tuple[float, float] = CURRENT_OBJECTIVE,
+        mission_type: int = MISSION_DESTROY_AND_REACH,
+        blue_controller: str = "cem",
+        blue_target_priority: str = "nearest",
     ):
         super().__init__("CEMEpisodeBattleModel")
         random.seed(seed)
@@ -1570,6 +1700,9 @@ class CEMEpisodeBattleModel(CoupledDEVS):
                 device=device,
                 rollout_backend=rollout_backend,
                 episode_seed=seed,
+                mission_type=mission_type,
+                blue_controller=blue_controller,
+                blue_target_priority=blue_target_priority,
                 rollout_replay_per_tick=rollout_replay_per_tick,
                 policy=policy,
                 policy_prior_mix=policy_prior_mix,
@@ -1620,6 +1753,11 @@ class CEMEpisodeBattleModel(CoupledDEVS):
                         target_type="soldier",
                         obstacles=obstacles,
                         target_priority=red_target_priority,
+                        lane_seed=seed,
+                        # BLUE가 거점을 지키는 임무일 때만 RED가 공격측이 된다.
+                        assault_target=(
+                            objective if mission_type == MISSION_HOLD_OBJECTIVE else None
+                        ),
                     ),
                     decision_delay=1.0,
                 )
@@ -1651,6 +1789,7 @@ def _write_episode_config(
     objective: tuple[float, float],
     obstacle_config: Mapping[str, object] | None = None,
     obstacle_config_source: Path | None = None,
+    mission_type: int = MISSION_DESTROY_AND_REACH,
 ) -> None:
     """episode 재현에 필요한 config를 저장한다."""
     config = {
@@ -1660,6 +1799,7 @@ def _write_episode_config(
         "duration": float(duration_sec),
         "rollout_backend": rollout_backend,
         "red_target_priority": red_target_priority,
+        "mission_type": MISSION_TYPE_NAMES[int(mission_type)],
         "write_csv_logs": bool(write_csv_logs),
         "obstacles": [list(rect) for rect in obstacles],
         "objective": [float(objective[0]), float(objective[1])],
@@ -1683,6 +1823,235 @@ def _write_episode_config(
     (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
+@dataclass(frozen=True)
+class EpisodeScenario:
+    """episode 하나가 쓸 지형·병력·임무 조합."""
+
+    map_name: str
+    obstacles: tuple[tuple[float, float, float, float], ...]
+    map_config: Mapping[str, object]
+    blue_positions: tuple[tuple[int, float, float, float], ...]
+    red_positions: tuple[tuple[int, float, float, float], ...]
+    objective: tuple[float, float]
+    mission_type: int
+
+
+def _sample_positions(
+    candidates: Sequence[tuple[float, float]],
+    *,
+    count: int,
+    first_id: int,
+    rng: random.Random,
+    min_spacing: float,
+    label: str,
+) -> tuple[tuple[int, float, float, float], ...]:
+    """자유 공간 후보에서 서로 떨어진 배치 좌표를 뽑는다."""
+    pool = list(candidates)
+    rng.shuffle(pool)
+    chosen: list[tuple[float, float]] = []
+    for point in pool:
+        if all(math.dist(point, picked) >= min_spacing for picked in chosen):
+            chosen.append(point)
+            if len(chosen) >= count:
+                break
+    if len(chosen) < count:
+        # 간격을 못 지킬 만큼 좁으면 간격 조건을 버리고 채운다.
+        for point in pool:
+            if point not in chosen:
+                chosen.append(point)
+            if len(chosen) >= count:
+                break
+    if len(chosen) < count:
+        raise ValueError(f"{label} {count}명을 배치할 자유 셀이 부족하다 (후보 {len(pool)})")
+    return tuple(
+        (first_id + index, float(x), float(y), 0.0)
+        for index, (x, y) in enumerate(chosen[:count])
+    )
+
+
+def _sample_scenario(
+    *,
+    map_configs: Sequence[tuple[str, Mapping[str, object]]],
+    rng: random.Random,
+    blue_min: int,
+    blue_max: int,
+    red_max: int,
+    red_min: int | None,
+    mission_types: Sequence[int],
+    min_spacing: float,
+) -> EpisodeScenario:
+    """episode마다 맵·병력 수·배치·임무를 새로 뽑는다.
+
+    지형을 고정하면 월드모델이 그 지형을 외우고, 배치를 고정하면 스폰 위치를
+    외운다. 둘 다 매번 바꿔야 "관측으로 적 위치를 좁힌다"는 능력이 학습된다.
+    """
+    map_name, map_config = rng.choice(list(map_configs))
+    obstacles = tuple(
+        tuple(float(value) for value in rect) for rect in map_config.get("obstacles", []) or []
+    )
+    real_map = map_config.get("real_map")
+    radius = real_map.get("unit_radius_units") if isinstance(real_map, Mapping) else None
+    if radius is not None:
+        set_path_pad(path_pad_for_unit_radius(float(radius)))
+
+    component = largest_free_component(list(obstacles))
+    if not component:
+        raise ValueError(f"{map_name}: 이동 가능한 자유 공간이 없다")
+    points = component_points(component)
+    center_x = (WORLD_X_MIN + WORLD_X_MAX) / 2.0
+    blue_side = [point for point in points if point[0] < center_x]
+    red_side = [point for point in points if point[0] >= center_x]
+    if not blue_side or not red_side:
+        raise ValueError(f"{map_name}: 진영을 나눌 자유 공간이 한쪽에 없다")
+
+    blue_count = rng.randint(blue_min, blue_max)
+    # BLUE가 열세이거나 대등한 상황만 만든다. 수적 우세일 때만 학습하면
+    # 후퇴·회피 같은 행동을 볼 기회가 없다.
+    # RED 하한을 주면 그 값으로 전력비를 고정할 수 있다(1v3 같은 평가 시나리오).
+    low = blue_count if red_min is None else max(blue_count, int(red_min))
+    red_count = rng.randint(low, max(low, red_max))
+
+    blue_positions = _sample_positions(
+        blue_side, count=blue_count, first_id=101, rng=rng, min_spacing=min_spacing, label="BLUE"
+    )
+    red_positions = _sample_positions(
+        red_side, count=red_count, first_id=201, rng=rng, min_spacing=min_spacing, label="RED"
+    )
+    mission_type = int(rng.choice(list(mission_types)))
+    if mission_type == MISSION_HOLD_OBJECTIVE:
+        # 거점 방어는 BLUE가 먼저 거점을 잡고 RED의 강습을 막는 구도여야 한다.
+        # 거점을 RED 진영에 두면 "쳐들어가서 빼앗은 뒤 확보"가 되어 임무가 뒤집힌다.
+        # 다만 BLUE 진영 끝에 두면 RED 이동(1.0/tick)만으로 제한 시간이 다 간다.
+        # 중앙에 가까운 절반에서 뽑아 양측 접촉 시간을 남긴다.
+        inner = sorted(blue_side, key=lambda point: -point[0])[: max(1, len(blue_side) // 2)]
+        objective_point = rng.choice(inner)
+    else:
+        # 나머지 임무는 RED 진영 쪽에 둬서 BLUE가 적을 통과해야 하게 만든다.
+        objective_point = rng.choice(red_side)
+    return EpisodeScenario(
+        map_name=map_name,
+        obstacles=obstacles,
+        map_config=map_config,
+        blue_positions=blue_positions,
+        red_positions=red_positions,
+        objective=(float(objective_point[0]), float(objective_point[1])),
+        mission_type=mission_type,
+    )
+
+
+def _apply_scenario(scenario: EpisodeScenario) -> None:
+    """뽑은 시나리오를 module-level 병력 layout에 반영한다."""
+    global BLUE_POSITIONS, RED_POSITIONS, BLUE_IDS, RED_IDS, ALL_UNIT_IDS, CURRENT_OBJECTIVE
+
+    BLUE_POSITIONS = scenario.blue_positions
+    RED_POSITIONS = scenario.red_positions
+    BLUE_IDS = tuple(position[0] for position in BLUE_POSITIONS)
+    RED_IDS = tuple(position[0] for position in RED_POSITIONS)
+    if len(set(BLUE_IDS + RED_IDS)) != len(BLUE_IDS) + len(RED_IDS):
+        raise ValueError("BLUE/RED unit id가 중복됐다")
+    ALL_UNIT_IDS = BLUE_IDS + RED_IDS
+    CURRENT_OBJECTIVE = scenario.objective
+
+
+def _mission_allows_early_stop(mission_type: int) -> bool:
+    """임무 달성 시점에 episode를 끊어도 되는지.
+
+    거점 방어는 "제한 시간까지 버티기"가 임무라, 점유하자마자 끊으면 임무가
+    무의미해진다. 나머지는 달성 후 남은 시간이 목적 없는 배회 구간이 된다.
+    """
+    return mission_type != MISSION_HOLD_OBJECTIVE
+
+
+def _make_termination_condition(
+    battle,
+    *,
+    duration_sec: float,
+    mission_type: int,
+    objective: tuple[float, float],
+    min_sec: float,
+):
+    """임무 달성 또는 BLUE 전멸 시 episode를 끊는 DEVS 종료 조건을 만든다.
+
+    학습 window는 history+pred 프레임이 모두 있어야 만들어지므로, 너무 일찍
+    끊으면 그 episode에서 학습할 게 남지 않는다. min_sec로 하한을 둔다.
+    """
+
+    def condition(clock, _model) -> bool:
+        time_sec = float(clock[0])
+        if time_sec >= duration_sec:
+            return True
+        if time_sec < min_sec:
+            return False
+        rows = battle.commander.latest_rows()
+        if not rows:
+            return False
+        try:
+            blue_alive = _any_blue_alive(rows)
+        except ValueError:
+            return False
+        if not blue_alive:
+            return True
+        if not _mission_allows_early_stop(mission_type):
+            return False
+        return mission_completed(
+            mission_type=mission_type,
+            red_alive=not _all_red_destroyed(rows),
+            blue_alive=blue_alive,
+            objective_reached=_objective_reached(rows, objective=objective),
+            time_sec=time_sec,
+            duration_sec=duration_sec,
+        )
+
+    return condition
+
+
+def _repair_layout_for_terrain(
+    obstacles: Sequence[Sequence[float]],
+    objective: tuple[float, float],
+) -> tuple[float, float]:
+    """스폰과 objective를 실제로 걸어다닐 수 있는 영역 안으로 옮긴다.
+
+    실측 건물맵은 일반 격자로 배치한 시작 좌표가 건물에 둘러싸인 막다른
+    구역에 떨어질 수 있다. 그 유닛은 A*가 경로를 못 찾아 에피소드 내내
+    정지하고, 학습 데이터에 "미관측 적은 안 움직인다"는 신호를 남긴다.
+    """
+    global BLUE_POSITIONS, RED_POSITIONS
+
+    if not obstacles:
+        return objective
+
+    component = largest_free_component([tuple(float(v) for v in rect) for rect in obstacles])
+    if not component:
+        raise ValueError("이동 가능한 자유 공간이 없다: 지형 또는 PATH_PAD를 확인해라")
+
+    repaired_objective = snap_to_component(objective, component)
+    if repaired_objective is None:
+        raise ValueError("objective를 이동 가능 영역으로 옮길 수 없다")
+    if repaired_objective != tuple(objective):
+        print(f"objective 보정: {tuple(objective)} -> {repaired_objective}")
+
+    taken: set = set()
+
+    def repair(positions, label: str):
+        out = []
+        for unit_id, x, y, heading in positions:
+            snapped = snap_to_component((x, y), component, exclude=taken)
+            if snapped is None:
+                raise ValueError(f"{label} {unit_id}를 배치할 자유 셀이 없다")
+            if snapped != (x, y):
+                print(
+                    f"{label} {unit_id} 스폰 보정: "
+                    f"({x:.2f},{y:.2f}) -> ({snapped[0]:.2f},{snapped[1]:.2f})"
+                )
+            taken.add(cell_of(snapped))
+            out.append((unit_id, float(snapped[0]), float(snapped[1]), heading))
+        return tuple(out)
+
+    BLUE_POSITIONS = repair(BLUE_POSITIONS, "BLUE")
+    RED_POSITIONS = repair(RED_POSITIONS, "RED")
+    return repaired_objective
+
+
 def run_episode(
     *,
     episode_index: int,
@@ -1703,8 +2072,14 @@ def run_episode(
     obstacle_config: Mapping[str, object] | None = None,
     obstacle_config_source: Path | None = None,
     objective: tuple[float, float] = CURRENT_OBJECTIVE,
+    mission_type: int = MISSION_DESTROY_AND_REACH,
+    min_episode_sec: float | None = None,
+    blue_controller: str = "cem",
+    blue_target_priority: str = "nearest",
 ) -> EpisodeResult:
     """DEVS episode를 새로 실행하고 CEM trajectory를 반환한다."""
+    # 지형이 정해진 뒤에 배치를 보정해야 한다. mixed terrain은 episode마다 다르다.
+    objective = _repair_layout_for_terrain(obstacles, objective)
     run_dir = output_root / f"episode_{episode_index:04d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
     _write_episode_config(
@@ -1721,6 +2096,7 @@ def run_episode(
         objective=objective,
         obstacle_config=obstacle_config,
         obstacle_config_source=obstacle_config_source,
+        mission_type=mission_type,
     )
     model.eval()
     battle = CEMEpisodeBattleModel(
@@ -1739,12 +2115,37 @@ def run_episode(
         red_target_priority=red_target_priority,
         write_csv_logs=write_csv_logs,
         objective=objective,
+        mission_type=mission_type,
+        blue_controller=blue_controller,
+        blue_target_priority=blue_target_priority,
     )
     simulator = Simulator(battle)
-    simulator.setTerminationTime(duration_sec)
+    # 학습 window 한 개를 만들려면 history+pred 프레임이 필요하다. 그 아래로는
+    # 임무를 달성해도 끊지 않는다.
+    floor_sec = (
+        float(model_config.history_frames + model_config.pred_frames)
+        if min_episode_sec is None
+        else float(min_episode_sec)
+    )
+    simulator.setTerminationCondition(
+        _make_termination_condition(
+            battle,
+            duration_sec=duration_sec,
+            mission_type=mission_type,
+            objective=objective,
+            min_sec=floor_sec,
+        )
+    )
     simulator.simulate()
     latest_rows = battle.commander.latest_rows()
-    outcome = determine_outcome(latest_rows, objective=objective)
+    final_time = max((float(row["time"]) for row in latest_rows), default=duration_sec)
+    outcome = determine_outcome(
+        latest_rows,
+        objective=objective,
+        mission_type=mission_type,
+        time_sec=final_time,
+        duration_sec=duration_sec,
+    )
     trajectory = battle.commander.trajectory(episode_id=run_dir.name, outcome=outcome)
     battle.commander.close()
     return EpisodeResult(
@@ -1766,6 +2167,50 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
         choices=("urban", "open", "mixed"),
         default="urban",
         help="urban은 DEFAULT_OBSTACLES 시가지, open은 장애물 없는 개활지, mixed는 episode마다 두 지형을 랜덤(50/50) 선택",
+    )
+    parser.add_argument(
+        "--obstacle-configs",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="여러 맵 config. 지정하면 episode마다 하나를 뽑고, 병력 수·배치·objective·임무도 매번 무작위로 정한다.",
+    )
+    parser.add_argument(
+        "--blue-team-size-min",
+        type=int,
+        default=1,
+        help="--obstacle-configs 사용 시 BLUE 병력 수 하한",
+    )
+    parser.add_argument(
+        "--blue-team-size-max",
+        type=int,
+        default=10,
+        help="--obstacle-configs 사용 시 BLUE 병력 수 상한",
+    )
+    parser.add_argument(
+        "--red-team-size-min",
+        type=int,
+        default=None,
+        help="RED 병력 수 하한. 생략하면 BLUE 수(항상 BLUE 이상). 특정 전력비를 고정할 때 쓴다.",
+    )
+    parser.add_argument(
+        "--red-team-size-max",
+        type=int,
+        default=10,
+        help="RED 병력 수 상한. RED는 항상 BLUE 이상으로 뽑혀 BLUE가 열세이거나 대등하다.",
+    )
+    parser.add_argument(
+        "--mission-types",
+        nargs="+",
+        default=sorted(MISSION_TYPE_BY_NAME),
+        choices=sorted(MISSION_TYPE_BY_NAME),
+        help="episode마다 뽑을 임무 종류",
+    )
+    parser.add_argument(
+        "--spawn-min-spacing",
+        type=float,
+        default=1.5,
+        help="무작위 배치 시 유닛 간 최소 간격(유닛)",
     )
     parser.add_argument(
         "--obstacle-config",
@@ -1920,7 +2365,20 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
         default=None,
         help="온라인 학습된 policy head 저장 경로. 생략하면 world model checkpoint 이름에서 파생한다",
     )
+    parser.add_argument(
+        "--blue-controller",
+        choices=("rule", "cem"),
+        default="rule",
+        help="BLUE 행동 생성기. rule은 규칙 정책(빠르고 교전이 확실해 학습 데이터 수집용), cem은 CEM 탐색(느리고 평가용)",
+    )
+    parser.add_argument("--blue-target-priority", choices=("nearest", "low_hp", "smart"), default="nearest")
     parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument(
+        "--min-episode-sec",
+        type=float,
+        default=None,
+        help="임무를 달성해도 이 시각 전에는 episode를 끊지 않는다. 생략하면 history+pred 프레임 수.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-root", type=Path, default=Path("output/episodic_cem_jepa"))
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -2040,10 +2498,28 @@ def main(argv: Iterable[str] | None = None) -> None:
             raise FileNotFoundError(f"validation run dir가 없다: {validation_dir}")
     obstacle_config = None
     configured_obstacles = None
+    map_pool: list[tuple[str, Mapping[str, object]]] | None = None
+    if args.obstacle_configs:
+        if args.blue_team_size_min < 1 or args.blue_team_size_min > args.blue_team_size_max:
+            raise ValueError("--blue-team-size-min/max 범위가 잘못됐다")
+        if args.red_team_size_max < args.blue_team_size_max:
+            raise ValueError("--red-team-size-max는 --blue-team-size-max 이상이어야 한다")
+        map_pool = []
+        for path in args.obstacle_configs:
+            if not path.exists():
+                raise FileNotFoundError(f"맵 config가 없다: {path}")
+            map_pool.append((path.parent.name or path.stem, json.loads(path.read_text(encoding="utf-8"))))
+        print(f"맵 풀 {len(map_pool)}개: {[name for name, _ in map_pool]}")
     if args.obstacle_config is not None:
         if not args.obstacle_config.exists():
             raise FileNotFoundError(f"obstacle config가 없다: {args.obstacle_config}")
         obstacle_config, configured_obstacles = _load_obstacle_config(args.obstacle_config)
+        # 경로 여유폭은 맵 스케일을 따라가야 한다. 고정 상수를 쓰면 격자 셀이
+        # 촘촘한 맵에서 골목이 통째로 막혀 전 유닛이 정지한다.
+        real_map = obstacle_config.get("real_map")
+        radius = real_map.get("unit_radius_units") if isinstance(real_map, Mapping) else None
+        if radius is not None:
+            print(f"PATH_PAD: {set_path_pad(path_pad_for_unit_radius(float(radius))):.3f} (unit_radius={float(radius)})")
     team_size = _configured_team_size(
         requested_team_size=args.team_size,
         obstacle_config=obstacle_config,
@@ -2299,7 +2775,30 @@ def main(argv: Iterable[str] | None = None) -> None:
     terrain_rng = random.Random(args.seed + 777)
     for episode_index in range(1, args.episodes + 1):
         completed_episode_count = episode_index
-        if configured_obstacles is not None:
+        episode_mission_type = MISSION_DESTROY_AND_REACH
+        if map_pool is not None:
+            # 맵·병력 수·배치·objective·임무를 episode마다 새로 뽑는다.
+            scenario = _sample_scenario(
+                map_configs=map_pool,
+                rng=terrain_rng,
+                blue_min=args.blue_team_size_min,
+                blue_max=args.blue_team_size_max,
+                red_max=args.red_team_size_max,
+                red_min=args.red_team_size_min,
+                mission_types=[MISSION_TYPE_BY_NAME[name] for name in args.mission_types],
+                min_spacing=args.spawn_min_spacing,
+            )
+            _apply_scenario(scenario)
+            episode_terrain = scenario.map_name
+            episode_obstacles = scenario.obstacles
+            episode_mission_type = scenario.mission_type
+            print(
+                f"episode={episode_index} map={scenario.map_name} "
+                f"{len(scenario.blue_positions)}v{len(scenario.red_positions)} "
+                f"mission={MISSION_TYPE_NAMES[scenario.mission_type]} "
+                f"objective=({scenario.objective[0]:.1f},{scenario.objective[1]:.1f})"
+            )
+        elif configured_obstacles is not None:
             episode_terrain = "obstacle_config"
             episode_obstacles = configured_obstacles
         elif args.terrain == "mixed":
@@ -2368,6 +2867,10 @@ def main(argv: Iterable[str] | None = None) -> None:
             obstacle_config=obstacle_config,
             obstacle_config_source=args.obstacle_config,
             objective=CURRENT_OBJECTIVE,
+            mission_type=episode_mission_type,
+            min_episode_sec=args.min_episode_sec,
+            blue_controller=args.blue_controller,
+            blue_target_priority=args.blue_target_priority,
         )
         windows = build_training_windows_from_episode(
             result.trajectory,

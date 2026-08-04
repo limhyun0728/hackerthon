@@ -25,6 +25,10 @@ from hackerthon.worldmodel.actions import ACTION_DIM, ActionType, NO_COMMAND_TYP
 from hackerthon.worldmodel.evaluator import BLUE_MAX_STEP_PER_SEC, EvaluatorWeights
 from hackerthon.worldmodel.slots import (
     MAX_FEATURE_DIM,
+    MISSION_DESTROY_ALL,
+    MISSION_DESTROY_AND_REACH,
+    MISSION_REACH_OBJECTIVE,
+    MISSION_HOLD_OBJECTIVE,
     OBJECTIVE_RADIUS,
     ObjectType,
     SlotBatch,
@@ -45,8 +49,24 @@ UNIT_AMMO_INDEX = 2
 UNIT_X_INDEX = 3
 UNIT_Y_INDEX = 4
 UNIT_ALIVE_INDEX = 7
+MISSION_TYPE_INDEX = 0
 MISSION_OBJECTIVE_X_INDEX = 1
 MISSION_OBJECTIVE_Y_INDEX = 2
+
+# 임무별 채점 배율. 같은 evaluator를 쓰되 무엇을 보상할지만 바꾼다.
+#   attack:    RED 격파 관련 항 (damage/kia/finish/hp_mass)
+#   progress:  objective 전진 항
+#   blue_loss: BLUE 피해 페널티
+MISSION_SCORE_SCALES: dict[int, tuple[float, float, float]] = {
+    MISSION_DESTROY_AND_REACH: (1.0, 1.0, 1.0),
+    # 도달 요구가 없으니 전진 보상을 낮추고 격파에 집중한다.
+    MISSION_DESTROY_ALL: (1.0, 0.25, 1.0),
+    # 침투 임무. 교전은 수단일 뿐이라 격파 보상을 줄이고 전진과 생존을 키운다.
+    MISSION_REACH_OBJECTIVE: (0.3, 3.0, 1.5),
+    # 거점 방어. objective로 붙는 전진 보상을 살려 두고(그래야 거점을 잡는다)
+    # BLUE 피해 페널티를 키워 무리한 돌격 대신 점유 유지를 고르게 한다.
+    MISSION_HOLD_OBJECTIVE: (0.6, 1.5, 2.5),
+}
 ACTION_TYPE_COUNT = len(ActionType)
 DEFAULT_ACTION_PRIOR = (0.20, 0.50, 0.25, 0.05)
 NO_ALIVE_BLUE_DISTANCE = math.hypot(WORLD_X_MAX - WORLD_X_MIN, WORLD_Y_MAX - WORLD_Y_MIN)
@@ -568,6 +588,17 @@ def _denorm_y(y_norm: torch.Tensor) -> torch.Tensor:
     return (y_norm + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN
 
 
+def _mission_type_from_start(start_features: torch.Tensor, type_ids: torch.Tensor) -> int:
+    """현재 mission slot에서 임무 종류를 읽는다."""
+    mission = torch.nonzero(type_ids == int(ObjectType.MISSION), as_tuple=False).flatten()
+    if mission.shape != (1,):
+        raise ValueError(f"mission slot은 정확히 하나여야 한다: count={mission.numel()}")
+    value = int(round(float(start_features[int(mission[0].detach().cpu().item()), MISSION_TYPE_INDEX])))
+    if value not in MISSION_SCORE_SCALES:
+        raise ValueError(f"모르는 mission_type: {value}")
+    return value
+
+
 def _objective_xy_from_start(start_features: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
     """현재 mission slot에서 objective 월드 좌표를 읽는다."""
     mission = torch.nonzero(type_ids == int(ObjectType.MISSION), as_tuple=False).flatten()
@@ -675,10 +706,23 @@ def score_future_features_torch(
         torch.full_like(objective_progress, weights.objective_progress),
     )
 
+    mission_type = _mission_type_from_start(start_features, type_ids)
+    attack_scale, progress_scale, blue_loss_scale = MISSION_SCORE_SCALES[mission_type]
+
     red_eliminated = torch.all((future_red_hp <= 0.01) | (future_red_alive < 0.5), dim=-1)
     distances = _objective_distance(future_features, objective_xy=objective_xy, blue_indices=blue_indices)
     objective_reached = distances <= OBJECTIVE_RADIUS
-    success = red_eliminated & objective_reached
+    # 임무마다 "성공한 프레임"의 정의가 다르다. early_success는 그 프레임에
+    # 얼마나 빨리 도달했는지를 보상하므로 조건도 임무를 따라가야 한다.
+    if mission_type == MISSION_DESTROY_AND_REACH:
+        success = red_eliminated & objective_reached
+    elif mission_type == MISSION_DESTROY_ALL:
+        success = red_eliminated
+    elif mission_type == MISSION_REACH_OBJECTIVE:
+        success = objective_reached
+    else:
+        # 거점 방어는 "지금 점유 중인가"가 곧 성공 상태다. 빨리 붙을수록 좋다.
+        success = objective_reached
     has_success = torch.any(success, dim=-1)
     first_success = torch.argmax(success.float(), dim=-1)
     early_success = torch.where(
@@ -687,13 +731,16 @@ def score_future_features_torch(
         torch.zeros_like(first_success, dtype=torch.float32),
     )
 
-    return (
+    attack_term = (
         weights.enemy_damage * enemy_damage
         + weights.enemy_hp_mass_reduction * enemy_hp_mass_reduction
         + weights.enemy_kia * enemy_kia
         + weights.enemy_finish * enemy_finish
-        - weights.blue_damage * blue_damage
-        + progress_weight * objective_progress
+    )
+    return (
+        attack_scale * attack_term
+        - blue_loss_scale * weights.blue_damage * blue_damage
+        + progress_scale * progress_weight * objective_progress
         + weights.early_success * early_success
         - weights.ammo_used * ammo_used
     ).float()

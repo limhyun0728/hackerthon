@@ -38,7 +38,14 @@ from hackerthon.worldmodel.object_slot_attention import (
     TypedObjectSlotEncoder,
     build_object_attention_mask,
 )
-from hackerthon.worldmodel.slots import ObjectType, SlotBatch, TeamId, build_slot_batch_from_v2_run, load_v2_config
+from hackerthon.worldmodel.slots import (
+    ObjectType,
+    SlotBatch,
+    TeamId,
+    build_slot_batch_from_v2_run,
+    load_v2_config,
+    objective_from_config,
+)
 
 MOVE_X_INDEX = 2
 MOVE_Y_INDEX = 3
@@ -422,6 +429,7 @@ def evaluate_proposer(args: argparse.Namespace) -> None:
                     obstacles=config["obstacles"],
                     base_time_sec=time_sec,
                     episode_duration_sec=float(config["duration"]),
+                    objective=objective_from_config(config),
                 )
                 scores = {}
                 for name, dist_fn in (

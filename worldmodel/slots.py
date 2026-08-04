@@ -44,7 +44,32 @@ class TeamId(IntEnum):
 # 현재 v2 시나리오의 고정 계약이다. config에 objective가 없으므로 코드의
 # 임무 정의와 같은 값을 명시 상수로 둔다.
 CURRENT_OBJECTIVE = (10.0, 0.0)
+
+# 임무 종류. mission slot feature 0번에 그대로 들어간다.
+#   DESTROY_AND_REACH: RED 전멸 뒤 objective 도달 (기존 단일 임무)
+#   DESTROY_ALL:       RED 전멸만 하면 성공. objective는 참고용 집결점
+#   REACH_OBJECTIVE:   교전과 무관하게 objective 도달이 목표(침투)
+#   HOLD_OBJECTIVE:    objective를 점유한 채 제한 시간까지 버티기(거점 방어).
+#                      이 임무에서만 RED가 순찰이 아니라 거점 공격으로 전환한다.
 MISSION_DESTROY_AND_REACH = 0
+MISSION_DESTROY_ALL = 1
+MISSION_REACH_OBJECTIVE = 2
+MISSION_HOLD_OBJECTIVE = 3
+
+MISSION_TYPES = (
+    MISSION_DESTROY_AND_REACH,
+    MISSION_DESTROY_ALL,
+    MISSION_REACH_OBJECTIVE,
+    MISSION_HOLD_OBJECTIVE,
+)
+
+MISSION_TYPE_NAMES = {
+    MISSION_DESTROY_AND_REACH: "destroy_and_reach",
+    MISSION_DESTROY_ALL: "destroy_all",
+    MISSION_REACH_OBJECTIVE: "reach_objective",
+    MISSION_HOLD_OBJECTIVE: "hold_objective",
+}
+MISSION_TYPE_BY_NAME = {name: value for value, name in MISSION_TYPE_NAMES.items()}
 OBJECTIVE_RADIUS = 1.0
 MAX_HP = 100.0
 MAX_AMMO = 30.0
@@ -244,11 +269,14 @@ def mission_feature(
     time_sec: float,
     duration_sec: float,
     unit_rows: Sequence[Mapping[str, str]],
-    objective: tuple[float, float] = CURRENT_OBJECTIVE,
+    objective: tuple[float, float],
+    mission_type: int = MISSION_DESTROY_AND_REACH,
 ) -> tuple[np.ndarray, np.ndarray]:
     """현재 임무 상태를 mission slot feature로 변환한다."""
     if duration_sec <= 0.0:
         raise ValueError("duration_sec는 0보다 커야 한다")
+    if mission_type not in MISSION_TYPES:
+        raise ValueError(f"모르는 mission_type: {mission_type}")
 
     red_alive = any(int(row["id"]) >= 200 and float(row["hp"]) > 0.0 for row in unit_rows)
     blue_positions = [
@@ -260,11 +288,18 @@ def mission_feature(
         math.hypot(x - objective[0], y - objective[1]) <= OBJECTIVE_RADIUS
         for x, y in blue_positions
     )
-    completion_flag = (not red_alive) and objective_reached
+    completion_flag = mission_completed(
+        mission_type=mission_type,
+        red_alive=red_alive,
+        blue_alive=bool(blue_positions),
+        objective_reached=objective_reached,
+        time_sec=time_sec,
+        duration_sec=duration_sec,
+    )
     time_remaining_ratio = max(0.0, (float(duration_sec) - float(time_sec)) / float(duration_sec))
 
     vector = (
-        float(MISSION_DESTROY_AND_REACH),
+        float(mission_type),
         _norm_x(objective[0]),
         _norm_y(objective[1]),
         time_remaining_ratio,
@@ -273,15 +308,46 @@ def mission_feature(
     return _padded(vector)
 
 
+def mission_completed(
+    *,
+    mission_type: int,
+    red_alive: bool,
+    blue_alive: bool,
+    objective_reached: bool,
+    time_sec: float,
+    duration_sec: float,
+) -> bool:
+    """임무별 성공 조건. mission slot의 completion_flag와 승패 판정이 함께 쓴다."""
+    if not blue_alive:
+        return False
+    if mission_type == MISSION_DESTROY_AND_REACH:
+        return (not red_alive) and objective_reached
+    if mission_type == MISSION_DESTROY_ALL:
+        return not red_alive
+    if mission_type == MISSION_REACH_OBJECTIVE:
+        return objective_reached
+    if mission_type == MISSION_HOLD_OBJECTIVE:
+        # 매 tick "지금 점유 중인가"로 본다. 종료 시각에만 참이 되게 하면
+        # 로그 마지막 tick(t=duration-1)까지 성공 신호가 한 번도 안 나온다.
+        return objective_reached
+    raise ValueError(f"모르는 mission_type: {mission_type}")
+
+
 def build_slot_batch(
     *,
     unit_rows: Sequence[Mapping[str, str]],
     obstacles: Sequence[Sequence[float]],
     time_sec: float,
     duration_sec: float,
-    objective: tuple[float, float] = CURRENT_OBJECTIVE,
+    objective: tuple[float, float],
+    mission_type: int = MISSION_DESTROY_AND_REACH,
 ) -> SlotBatch:
-    """유닛, 지형, 임무 상태를 하나의 slot batch로 묶는다."""
+    """유닛, 지형, 임무 상태를 하나의 slot batch로 묶는다.
+
+    objective에 기본값을 두지 않는다. 예전에는 호출부가 빠뜨리면 조용히
+    CURRENT_OBJECTIVE로 떨어져서, 실제 임무와 다른 좌표가 mission slot에
+    들어가고 CEM이 엉뚱한 목표로 채점됐다.
+    """
     features: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     type_ids: list[int] = []
@@ -319,6 +385,7 @@ def build_slot_batch(
         duration_sec=duration_sec,
         unit_rows=unit_rows,
         objective=objective,
+        mission_type=mission_type,
     )
     features.append(mission_features)
     masks.append(mission_mask)
@@ -338,6 +405,24 @@ def build_slot_batch(
         names=tuple(names),
         time_sec=float(time_sec),
     )
+
+
+def objective_from_config(config: Mapping[str, object]) -> tuple[float, float]:
+    """run config에서 objective를 읽는다. 없으면 기본 시나리오 값을 쓴다."""
+    objective = config.get("objective")
+    if isinstance(objective, Sequence) and not isinstance(objective, (str, bytes)) and len(objective) == 2:
+        return (float(objective[0]), float(objective[1]))
+    return CURRENT_OBJECTIVE
+
+
+def mission_type_from_config(config: Mapping[str, object]) -> int:
+    """run config에서 mission_type을 읽는다. 예전 로그에는 없으므로 기본값을 쓴다."""
+    value = config.get("mission_type")
+    if isinstance(value, str):
+        return MISSION_TYPE_BY_NAME.get(value, MISSION_DESTROY_AND_REACH)
+    if isinstance(value, int) and value in MISSION_TYPES:
+        return int(value)
+    return MISSION_DESTROY_AND_REACH
 
 
 def load_v2_config(run_dir: Path) -> Mapping[str, object]:
@@ -373,6 +458,7 @@ def build_slot_batch_from_v2_run(run_dir: Path, time_sec: float) -> SlotBatch:
         obstacles=obstacles,
         time_sec=time_sec,
         duration_sec=duration_sec,
+        objective=objective_from_config(config),
     )
 
 

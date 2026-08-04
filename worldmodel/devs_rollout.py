@@ -50,6 +50,10 @@ class RolloutSnapshot:
     obstacles: tuple[tuple[float, float, float, float], ...]
     base_time_sec: float
     episode_duration_sec: float
+    # rollout이 만드는 mission slot에 들어갈 실제 임무 목표. 기본값을 두면
+    # 호출부가 빠뜨렸을 때 조용히 다른 좌표로 채점된다.
+    objective: tuple[float, float]
+    mission_type: int
 
     def __post_init__(self) -> None:
         """스냅샷 계약을 즉시 검증한다."""
@@ -383,6 +387,8 @@ def _frames_to_features(
             obstacles=snapshot.obstacles,
             time_sec=snapshot.base_time_sec + float(step),
             duration_sec=snapshot.episode_duration_sec,
+            objective=snapshot.objective,
+            mission_type=snapshot.mission_type,
         )
         feature_frames.append(batch.features)
     return np.stack(feature_frames, axis=0)
@@ -440,6 +446,8 @@ def snapshot_from_slot_rows(
     obstacles: Sequence[Sequence[float]],
     base_time_sec: float,
     episode_duration_sec: float,
+    objective: tuple[float, float],
+    mission_type: int,
 ) -> RolloutSnapshot:
     """commander가 들고 있는 현재 unit row로 rollout 스냅샷을 만든다."""
     return RolloutSnapshot(
@@ -449,4 +457,6 @@ def snapshot_from_slot_rows(
         ),
         base_time_sec=float(base_time_sec),
         episode_duration_sec=float(episode_duration_sec),
+        objective=(float(objective[0]), float(objective[1])),
+        mission_type=int(mission_type),
     )

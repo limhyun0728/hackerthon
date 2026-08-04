@@ -39,8 +39,29 @@ URBAN_OBSTACLES: List[Rect] = [
 DEFAULT_OBSTACLES = URBAN_OBSTACLES
 
 # 경로 계산 시 유닛 반경만큼 장애물을 부풀린다(벽 스침 방지).
-PATH_PAD = 0.45
+#
+# 이 값은 통로 폭 하한을 정한다: 폭 2*PATH_PAD 미만 통로는 전부 통행 불가가 된다.
+# 예전 0.45는 기본 URBAN_OBSTACLES(폭 1~3u 엄폐물) 기준으로 잡힌 값이라,
+# 실측 건물맵처럼 격자 셀이 촘촘한 지형에서는 골목을 통째로 막아 유닛이
+# 영구 정지한다. 실제 유닛 반경(예: 0.035u)보다는 넉넉하되 통로는 살리는
+# 보수적인 값으로 낮췄다. set_path_pad()로 맵 config에서 덮어쓸 수 있다.
+DEFAULT_PATH_PAD = 0.15
+PATH_PAD = DEFAULT_PATH_PAD
 GRID_RES = 0.5
+
+
+def set_path_pad(pad: float) -> float:
+    """경로 계산용 장애물 팽창 폭을 바꾼다. 맵 config에서 유도할 때 쓴다."""
+    global PATH_PAD
+    if pad <= 0.0:
+        raise ValueError("PATH_PAD는 0보다 커야 한다")
+    PATH_PAD = float(pad)
+    return PATH_PAD
+
+
+def path_pad_for_unit_radius(unit_radius_units: float, *, floor: float = 0.10) -> float:
+    """유닛 반경에서 경로 여유폭을 유도한다. 너무 작아지지 않게 floor를 둔다."""
+    return max(float(floor), 2.0 * float(unit_radius_units))
 
 
 def _segment_intersects_rect(p: Tuple[float, float], q: Tuple[float, float], rect: Rect, pad: float = 0.0) -> bool:
@@ -197,6 +218,94 @@ def next_waypoint(
         return target
     scale = remaining / dist
     return (start[0] + (target[0] - start[0]) * scale, start[1] + (target[1] - start[1]) * scale)
+
+
+def _neighbors(cell: Tuple[int, int], obstacles: List[Rect]):
+    """astar_path와 같은 이동 규칙(8방향 + 모서리 컷 금지)으로 이웃 셀을 낸다."""
+    cx, cy = cell
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nxt = (cx + dx, cy + dy)
+            if not _cell_free(nxt, obstacles):
+                continue
+            if dx and dy and not (
+                _cell_free((cx + dx, cy), obstacles) and _cell_free((cx, cy + dy), obstacles)
+            ):
+                continue
+            yield nxt
+
+
+def free_component(start: Tuple[float, float], obstacles: List[Rect]) -> set:
+    """start 지점에서 실제로 걸어갈 수 있는 격자 셀 집합을 반환한다."""
+    origin = _cell(start)
+    if not _cell_free(origin, obstacles):
+        return set()
+    seen = {origin}
+    stack = [origin]
+    while stack:
+        for nxt in _neighbors(stack.pop(), obstacles):
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
+
+
+def largest_free_component(obstacles: List[Rect]) -> set:
+    """월드 전체에서 가장 넓은 이동 가능 영역을 반환한다.
+
+    시작 위치나 목표가 이 영역 밖이면 그 유닛은 어디로도 갈 수 없다.
+    """
+    x_cells = range(int(math.floor(WORLD_X_MIN / GRID_RES)), int(math.ceil(WORLD_X_MAX / GRID_RES)) + 1)
+    y_cells = range(int(math.floor(WORLD_Y_MIN / GRID_RES)), int(math.ceil(WORLD_Y_MAX / GRID_RES)) + 1)
+    unvisited = {(cx, cy) for cx in x_cells for cy in y_cells if _cell_free((cx, cy), obstacles)}
+    best: set = set()
+    while unvisited:
+        seed = next(iter(unvisited))
+        component = {seed}
+        stack = [seed]
+        while stack:
+            for nxt in _neighbors(stack.pop(), obstacles):
+                if nxt not in component:
+                    component.add(nxt)
+                    stack.append(nxt)
+        unvisited -= component
+        if len(component) > len(best):
+            best = component
+    return best
+
+
+def cell_of(point: Tuple[float, float]) -> Tuple[int, int]:
+    """좌표가 속한 격자 셀. 스폰 보정에서 중복 배치를 막을 때 쓴다."""
+    return _cell(point)
+
+
+def snap_to_component(
+    point: Tuple[float, float],
+    component: set,
+    exclude: Optional[set] = None,
+) -> Optional[Tuple[float, float]]:
+    """point를 주어진 이동 가능 영역 안의 가장 가까운 셀 중심으로 옮긴다.
+
+    exclude에 든 셀은 건너뛴다(유닛 스폰이 한 칸에 겹치지 않게).
+    """
+    if not component:
+        return None
+    blocked = exclude or set()
+    origin = _cell(point)
+    if origin in component and origin not in blocked:
+        return point
+    usable = component - blocked
+    if not usable:
+        return None
+    best = min(usable, key=lambda c: math.dist(point, _cell_center(c)))
+    return _cell_center(best)
+
+
+def component_points(component: set) -> List[Tuple[float, float]]:
+    """이동 가능 영역의 셀 중심 좌표 목록. 순회 순서는 결정적이다."""
+    return [_cell_center(cell) for cell in sorted(component)]
 
 
 def ring_positions(
