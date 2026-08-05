@@ -40,6 +40,9 @@ from hackerthon.worldmodel.slots import (
     objective_from_config,
 )
 
+# 한 번에 GPU에 올리는 후보 수. 실측맵 슬롯 수에서 OOM을 막는다.
+ROLLOUT_CHUNK_SIZE = 16
+
 UNIT_HP_INDEX = 1
 UNIT_X_INDEX = 3
 UNIT_Y_INDEX = 4
@@ -195,13 +198,22 @@ def measure_tick(
         mission_type=mission_type_from_config(load_v2_config(run_dir)),
     )
     devs_features = rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
-    jepa_features = rollout_with_world_model(
-        model=model,
-        history_batches=history_batches,
-        observed_actions=observed,
-        future_plans=plans,
-        device=device,
-    )
+    # 후보를 한 번에 넣으면 슬롯 수(실측맵 지형 100~200개)에 어텐션이 O(N^2)로
+    # 곱해져 후보 64개에서 48GB를 넘긴다. 청크로 나눠 메모리를 상한에 묶는다.
+    chunks = []
+    for start in range(0, plans.action_features.shape[0], ROLLOUT_CHUNK_SIZE):
+        stop = min(start + ROLLOUT_CHUNK_SIZE, plans.action_features.shape[0])
+        index = torch.arange(start, stop, device=plans.action_features.device)
+        chunks.append(
+            rollout_with_world_model(
+                model=model,
+                history_batches=history_batches,
+                observed_actions=observed,
+                future_plans=plans.take_candidates(index),
+                device=device,
+            )
+        )
+    jepa_features = torch.cat(chunks, dim=0)
     if not isinstance(jepa_features, torch.Tensor):
         jepa_features = torch.as_tensor(jepa_features, device=device)
 

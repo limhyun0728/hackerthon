@@ -815,6 +815,7 @@ class CEMCommanderAtomic(AtomicDEVS):
         rollout_backend: str = "jepa",
         episode_seed: int | None = None,
         rollout_replay_per_tick: int = 0,
+        rollout_replay_stride: int = 1,
         policy: PolicyHead | None = None,
         policy_prior_mix: float = 0.25,
         red_target_priority: str = "nearest",
@@ -879,6 +880,7 @@ class CEMCommanderAtomic(AtomicDEVS):
         self._generator.manual_seed(self.episode_seed)
         # DEVS rollout 결과를 학습 데이터로 회수할 tick당 후보 수 (0이면 비활성).
         self.rollout_replay_per_tick = int(rollout_replay_per_tick)
+        self.rollout_replay_stride = int(rollout_replay_stride)
         self.rollout_windows: list[LoadedTrainingWindow] = []
         self._replay_generator = torch.Generator(device=self.device)
         self._replay_generator.manual_seed(self.episode_seed + 9999)
@@ -941,6 +943,10 @@ class CEMCommanderAtomic(AtomicDEVS):
             self._record_commands(
                 current_time, commands, selector="blue_rule", best_score=0.0, population_mean=0.0
             )
+            # 실행은 규칙 정책이 하되, 학습 데이터에는 반사실적 액션의 결과도 넣는다.
+            # 규칙 궤적만으로 학습하면 CEM이 평가 때 던지는 무작위 액션 영역에서
+            # 모델이 외삽하게 되고, 그게 곧 계획 품질 저하로 돌아온다.
+            self._collect_rule_rollout_replay(current_batch)
         else:
             plan, selector, best_score, population_mean = self._select_plan(current_batch)
             commands = self._commands_from_plan(plan, current_batch=current_batch, step_index=0)
@@ -1282,6 +1288,40 @@ class CEMCommanderAtomic(AtomicDEVS):
             names=tuple(unit_name(int(unit_id)) for unit_id in blue_unit_ids),
             time_sec=float(time_sec),
         )
+
+    def _collect_rule_rollout_replay(self, current_batch: SlotBatch) -> None:
+        """규칙 정책 실행 중에도 무작위 후보를 DEVS로 굴려 학습 window로 회수한다.
+
+        CEM 탐색은 하지 않는다. 초기 분포에서 한 번 샘플링해 그대로 rollout하므로
+        액션 분포가 prior 그대로이고, 커버리지 확보라는 목적에 맞는다.
+        """
+        if self.rollout_replay_per_tick <= 0:
+            return
+        # 인접 tick의 state는 거의 같아 매 tick 회수하면 중복이 크다. 결심 주기
+        # 간격으로만 돌려 커버리지는 지키고 비용을 stride배 줄인다.
+        if int(round(float(current_batch.time_sec))) % max(1, self.rollout_replay_stride) != 0:
+            return
+        if self.cem_config.future_horizon != self.model_config.pred_frames:
+            return
+        if not self._has_model_history(current_batch):
+            return
+        cem_config = replace(self.cem_config, num_candidates=self.rollout_replay_per_tick)
+        distribution = self._apply_current_engage_hard_mask(
+            build_initial_distribution(current_batch, cem_config, device=self.device),
+            current_batch=current_batch,
+        )
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.episode_seed * 7717 + int(round(float(current_batch.time_sec))))
+        plans = sample_future_action_plans(
+            distribution=distribution,
+            current_batch=current_batch,
+            config=cem_config,
+            generator=generator,
+            device=self.device,
+        )
+        rollout_fn, holder = self._devs_rollout_fn(current_batch)
+        rollout_fn(plans)
+        self._collect_rollout_replay(current_batch, holder)
 
     def _collect_rollout_replay(self, current_batch: SlotBatch, holder: dict) -> None:
         """마지막 CEM iteration의 DEVS rollout 결과를 학습 window로 회수한다.
@@ -1654,6 +1694,7 @@ class CEMEpisodeBattleModel(CoupledDEVS):
         device: torch.device,
         rollout_backend: str = "jepa",
         rollout_replay_per_tick: int = 0,
+        rollout_replay_stride: int = 1,
         policy: PolicyHead | None = None,
         policy_prior_mix: float = 0.25,
         red_target_priority: str = "nearest",
@@ -1704,6 +1745,7 @@ class CEMEpisodeBattleModel(CoupledDEVS):
                 blue_controller=blue_controller,
                 blue_target_priority=blue_target_priority,
                 rollout_replay_per_tick=rollout_replay_per_tick,
+                rollout_replay_stride=rollout_replay_stride,
                 policy=policy,
                 policy_prior_mix=policy_prior_mix,
                 red_target_priority=red_target_priority,
@@ -2065,6 +2107,7 @@ def run_episode(
     obstacles: Sequence[Sequence[float]] = DEFAULT_OBSTACLES,
     rollout_backend: str = "jepa",
     rollout_replay_per_tick: int = 0,
+    rollout_replay_stride: int = 1,
     policy: PolicyHead | None = None,
     policy_prior_mix: float = 0.25,
     red_target_priority: str = "nearest",
@@ -2110,6 +2153,7 @@ def run_episode(
         device=device,
         rollout_backend=rollout_backend,
         rollout_replay_per_tick=rollout_replay_per_tick,
+        rollout_replay_stride=rollout_replay_stride,
         policy=policy,
         policy_prior_mix=policy_prior_mix,
         red_target_priority=red_target_priority,
@@ -2259,6 +2303,12 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
         type=int,
         default=8,
         help="tick당 학습으로 회수할 DEVS rollout 후보 수 (상위 절반 + 무작위 절반, 0이면 비활성)",
+    )
+    parser.add_argument(
+        "--rollout-replay-stride",
+        type=int,
+        default=1,
+        help="몇 tick마다 rollout replay를 회수할지. 인접 tick은 state가 거의 같아 중복이 크다",
     )
     parser.add_argument(
         "--devs-warmup-episodes",
@@ -2860,6 +2910,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             obstacles=episode_obstacles,
             rollout_backend=effective_rollout_backend,
             rollout_replay_per_tick=args.rollout_replay_per_tick,
+            rollout_replay_stride=args.rollout_replay_stride,
             policy=policy if policy_active else None,
             policy_prior_mix=policy_prior_mix,
             red_target_priority=args.red_target_priority,
