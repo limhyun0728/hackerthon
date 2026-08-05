@@ -103,6 +103,20 @@ def _inside_any(x: float, y: float, rects) -> bool:
     return any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in rects)
 
 
+def _penetration_depth(x: float, y: float, rects) -> float:
+    """건물 안에 있을 때 가장 가까운 벽까지의 거리(유닛). 밖이면 0.
+
+    벽에 살짝 걸친 것은 예측 오차로 읽히지만, 건물 한복판은 화면에서 바로
+    "관통"으로 보인다. 위반 비율만으로는 이 둘을 구분할 수 없다.
+    """
+    best = 0.0
+    for x0, y0, x1, y1 in rects:
+        if not (x0 <= x <= x1 and y0 <= y <= y1):
+            continue
+        best = max(best, min(x - x0, x1 - x, y - y0, y1 - y))
+    return best
+
+
 def _load_model(checkpoint: Path, device: torch.device):
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     config_dict = dict(payload["model_config"])
@@ -144,7 +158,8 @@ def measure(
     # 물리 위반 : 예측이 건물 안이거나 한 스텝 이동 상한을 넘는 비율.
     # 화면 재생에서 벽 통과/순간이동으로 바로 보이는 항목이다.
     physics = {
-        name: {"inside": 0.0, "jump": 0.0, "frames": 0.0, "steps": 0.0, "max_step": 0.0}
+        name: {"inside": 0.0, "jump": 0.0, "frames": 0.0, "steps": 0.0, "max_step": 0.0,
+               "depths": []}
         for name in ("model", "devs")
     }
     unobserved_total = np.zeros(horizon)
@@ -302,8 +317,10 @@ def measure(
             bucket = physics[name]
             bucket["frames"] += float(alive_.sum())
             for cand, step, unit in zip(*np.nonzero(alive_)):
-                if _inside_any(xs_[cand, step, unit], ys_[cand, step, unit], rects):
+                depth = _penetration_depth(xs_[cand, step, unit], ys_[cand, step, unit], rects)
+                if depth > 0.0:
                     bucket["inside"] += 1.0
+                    bucket["depths"].append(depth)
             caps = np.where(is_red, RED_MAX_SPEED, BLUE_MAX_SPEED)[None, None, :]
             moved = np.hypot(np.diff(xs_, axis=1), np.diff(ys_, axis=1))
             moving = alive_[:, 1:]
@@ -400,6 +417,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"  {name:<6} 건물 안 {inside:>5.2f}%  이동상한 초과 {jump:>5.2f}%  "
             f"최대 스텝 {bucket['max_step'] * METERS_PER_UNIT:>5.1f}m/s"
         )
+        if bucket["depths"]:
+            depths = np.array(bucket["depths"]) * METERS_PER_UNIT
+            deep = 100.0 * float((depths > 5.0).mean())
+            print(
+                f"         관통 깊이(벽까지) p50 {np.percentile(depths, 50):>4.1f}m  "
+                f"p90 {np.percentile(depths, 90):>4.1f}m  max {depths.max():>5.1f}m  "
+                f"| 5m 초과 {deep:>4.1f}%"
+            )
 
     print(f"\n{'='*74}")
     print(f"예측 오차 분포 (m)")
