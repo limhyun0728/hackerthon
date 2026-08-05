@@ -282,7 +282,7 @@ function initMap() {
   const cfg = S.maps[S.mapName]; if (!cfg) return;
   const c = cfg.real_map||{};
   if (!S.map) {
-    S.map = new naver.maps.Map('map', { center:new naver.maps.LatLng(c.origin_lat, c.origin_lon), zoom:16 });
+    S.map = new naver.maps.Map('map', { center:new naver.maps.LatLng(c.origin_lat, c.origin_lon), zoom:17 });
     naver.maps.Event.addListener(S.map, 'click', (e) => {
       if (S.session) return;                       // 작전 시작 후에는 배치 불가
       const xy = latLngToXY(e.coord);

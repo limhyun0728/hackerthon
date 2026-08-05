@@ -22,12 +22,16 @@ import os
 import sys
 import uuid
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -87,6 +91,9 @@ UNIT_COS_INDEX = 5
 UNIT_SIN_INDEX = 6
 
 # 태세 축 격자. 절대 단위로 고정해야 시나리오가 바뀌어도 셀 의미가 유지된다.
+# 월드모델 rollout을 나눠 넣을 후보 수. 슬롯이 많은 실측맵에서 OOM을 막는다.
+CHUNK_SIZE = 16
+
 ENGAGE_EDGES = (0.0, 0.001, 0.15, 0.35, 0.60)
 SPREAD_EDGES = (0.0, 2.0, 5.0, 10.0, 15.0)
 ENGAGE_LABELS = ("순수기동", "산발사격", "교전", "적극교전", "전력사격")
@@ -316,10 +323,22 @@ def build_archive(
             action_unit_ids=unit_ids.to(device=device),
             issued_mask=torch.zeros((need - 1, num_units), dtype=torch.bool, device=device),
         )
-        features = rollout_with_world_model(
-            model=model, history_batches=tuple(hist), observed_actions=observed,
-            future_plans=plans, device=device,
-        )
+        # 후보 전체를 한 번에 넣으면 슬롯 수(지형 100~200개)에 어텐션이 O(N^2)로
+        # 곱해져 GPU 메모리가 터진다. 청크로 나눠 메모리를 상한에 묶는다.
+        chunks = []
+        for start in range(0, plans.action_features.shape[0], CHUNK_SIZE):
+            stop = min(start + CHUNK_SIZE, plans.action_features.shape[0])
+            index = torch.arange(start, stop, device=plans.action_features.device)
+            chunks.append(
+                rollout_with_world_model(
+                    model=model,
+                    history_batches=tuple(hist),
+                    observed_actions=observed,
+                    future_plans=plans.take_candidates(index),
+                    device=device,
+                )
+            )
+        features = torch.cat(chunks, dim=0)
     else:
         features = rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
     scores = score_future_features_torch(current_batch=batch, future_features=features).detach().cpu().numpy()
@@ -385,7 +404,15 @@ def build_archive(
 class PlatformState:
     """서버 전역 상태. 맵 목록과 세션들을 들고 있다."""
 
-    def __init__(self, maps_root: Path, *, device: torch.device, candidates: int, horizon: int):
+    def __init__(
+        self,
+        maps_root: Path,
+        *,
+        device: torch.device,
+        candidates: int,
+        horizon: int,
+        world_model_checkpoint: Path | None = None,
+    ):
         self.maps: dict[str, dict[str, Any]] = {}
         for path in sorted(maps_root.iterdir()):
             config_path = path / "config.json"
@@ -403,6 +430,20 @@ class PlatformState:
         self.candidates = candidates
         self.horizon = horizon
         self.sessions: dict[str, Session] = {}
+        self.model = None
+        self.model_config = None
+        if world_model_checkpoint is not None:
+            payload = torch.load(world_model_checkpoint, map_location=device, weights_only=False)
+            config_dict = dict(payload["model_config"])
+            config_dict["maskable_type_ids"] = tuple(config_dict["maskable_type_ids"])
+            self.model_config = ObjectSlotModelConfig(**config_dict)
+            self.model = DEVSObjectCentricWorldModel(self.model_config).to(device)
+            self.model.load_state_dict(payload["model_state_dict"])
+            self.model.eval()
+            print(
+                f"월드모델 로드: {world_model_checkpoint.name} "
+                f"(pred_frames={self.model_config.pred_frames}, history={self.model_config.history_frames})"
+            )
 
     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         map_name = str(payload.get("map") or next(iter(self.maps)))
@@ -524,7 +565,10 @@ class PlatformState:
     def candidates_view(self, session_id: str) -> dict[str, Any]:
         session = self.sessions[session_id]
         seed = int(session.current.time_sec) * 7919 + len(session.nodes)
-        return build_archive(session, candidates=self.candidates, seed=seed, device=self.device)
+        return build_archive(
+            session, candidates=self.candidates, seed=seed, device=self.device,
+            model=self.model, model_config=self.model_config,
+        )
 
     def recommend(self, session_id: str, *, candidates: int | None = None) -> dict[str, Any]:
         """현재 지점에서 매 결심마다 최고 점수 후보를 이어붙여 끝까지 전개한다.
@@ -551,7 +595,8 @@ class PlatformState:
             session.current_id = "probe"
             try:
                 archive = build_archive(
-                    session, candidates=num, seed=int(time_sec) * 7919 + len(picks), device=self.device
+                    session, candidates=num, seed=int(time_sec) * 7919 + len(picks),
+                    device=self.device, model=self.model, model_config=self.model_config,
                 )
             finally:
                 session.nodes, session.current_id = saved_nodes, saved_id
@@ -605,80 +650,125 @@ class PlatformState:
         return self.session_view(session_id)
 
 
-def _make_handler(state: PlatformState):
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):  # 요청 로그 억제
-            return
+class SessionRequest(BaseModel):
+    """작전 개시 요청. 배치를 안 주면 무작위로 채운다."""
 
-        def _send(self, payload: Any, *, status: int = 200, content_type: str = "application/json"):
-            body = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+    map: str | None = None
+    mission: str = "destroy_all"
+    blue: int = Field(5, ge=1, le=10)
+    red: int = Field(7, ge=1, le=10)
+    duration: float = Field(60.0, gt=0)
+    seed: int = 0
+    blue_positions: list[tuple[float, float]] | None = None
+    red_positions: list[tuple[float, float]] | None = None
+    objective: tuple[float, float] | None = None
 
-        def do_GET(self):
-            try:
-                if self.path == "/" or self.path.startswith("/index"):
-                    self._send(PAGE_HTML.encode(), content_type="text/html; charset=utf-8")
-                elif self.path == "/api/maps":
-                    self._send(
-                        {
-                            "maps": [
-                                {
-                                    "name": name,
-                                    "real_map": config.get("real_map", {}),
-                                    "obstacles": config.get("obstacles", []),
-                                    "building_polygons": config.get("building_polygons", []),
-                                }
-                                for name, config in sorted(state.maps.items())
-                            ],
-                            "naver_client_id": state.naver_client_id,
-                        }
-                    )
-                elif self.path.startswith("/api/session/"):
-                    self._send(state.session_view(self.path.rsplit("/", 1)[-1]))
-                elif self.path.startswith("/api/candidates/"):
-                    self._send(state.candidates_view(self.path.rsplit("/", 1)[-1]))
-                else:
-                    self._send({"error": "not found"}, status=404)
-            except Exception as error:  # UI에 그대로 보여준다
-                self._send({"error": f"{type(error).__name__}: {error}"}, status=500)
 
-        def do_POST(self):
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-                payload = json.loads(self.rfile.read(length) or b"{}")
-                if self.path == "/api/session":
-                    self._send(state.create_session(payload))
-                elif self.path == "/api/recommend":
-                    self._send(state.recommend(payload["session"]))
-                elif self.path == "/api/random":
-                    self._send(state.random_placement(payload))
-                elif self.path == "/api/select":
-                    self._send(
-                        state.select(payload["session"], int(payload["engage_bin"]), int(payload["spread_bin"]))
-                    )
-                elif self.path == "/api/goto":
-                    self._send(state.goto(payload["session"], payload["node"]))
-                else:
-                    self._send({"error": "not found"}, status=404)
-            except Exception as error:
-                self._send({"error": f"{type(error).__name__}: {error}"}, status=500)
+class RandomRequest(BaseModel):
+    """무작위 배치 요청."""
 
-    return Handler
+    map: str | None = None
+    mission: str = "destroy_all"
+    blue: int = Field(5, ge=1, le=10)
+    red: int = Field(7, ge=1, le=10)
+    seed: int = 0
+
+
+class SelectRequest(BaseModel):
+    """아카이브 셀 선택."""
+
+    session: str
+    engage_bin: int = Field(ge=0)
+    spread_bin: int = Field(ge=0)
+
+
+class SessionOnly(BaseModel):
+    session: str
+
+
+class GotoRequest(BaseModel):
+    session: str
+    node: str
+
+
+def create_app(state: PlatformState) -> FastAPI:
+    """플랫폼 API. 무거운 계산은 threadpool로 빼 다른 요청을 막지 않는다."""
+    app = FastAPI(title="지휘관 시뮬레이션 플랫폼", docs_url="/docs")
+
+    def _guard(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=f"없는 세션/노드: {error}") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=500, detail=f"{type(error).__name__}: {error}") from error
+
+    @app.get("/", response_class=HTMLResponse)
+    async def page() -> str:
+        return PAGE_HTML
+
+    @app.get("/api/maps")
+    async def maps() -> dict[str, Any]:
+        return {
+            "maps": [
+                {
+                    "name": name,
+                    "real_map": config.get("real_map", {}),
+                    "obstacles": config.get("obstacles", []),
+                    "building_polygons": config.get("building_polygons", []),
+                }
+                for name, config in sorted(state.maps.items())
+            ],
+            "naver_client_id": state.naver_client_id,
+        }
+
+    @app.post("/api/session")
+    async def create(request: SessionRequest) -> dict[str, Any]:
+        return await run_in_threadpool(_guard, state.create_session, request.model_dump())
+
+    @app.post("/api/random")
+    async def random_placement(request: RandomRequest) -> dict[str, Any]:
+        return await run_in_threadpool(_guard, state.random_placement, request.model_dump())
+
+    @app.get("/api/session/{session_id}")
+    async def view(session_id: str) -> dict[str, Any]:
+        return _guard(state.session_view, session_id)
+
+    @app.get("/api/candidates/{session_id}")
+    async def candidates(session_id: str) -> dict[str, Any]:
+        return await run_in_threadpool(_guard, state.candidates_view, session_id)
+
+    @app.post("/api/recommend")
+    async def recommend(request: SessionOnly) -> dict[str, Any]:
+        return await run_in_threadpool(_guard, state.recommend, request.session)
+
+    @app.post("/api/select")
+    async def select(request: SelectRequest) -> dict[str, Any]:
+        return _guard(state.select, request.session, request.engage_bin, request.spread_bin)
+
+    @app.post("/api/goto")
+    async def goto(request: GotoRequest) -> dict[str, Any]:
+        return _guard(state.goto, request.session, request.node)
+
+    return app
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="지휘관 시뮬레이션 플랫폼")
     parser.add_argument("--maps-root", type=Path, default=Path("output/maps"))
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8900)
+    parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--candidates", type=int, default=256)
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--world-model-checkpoint",
+        type=Path,
+        default=None,
+        help="지정하면 후보 rollout을 DEVS 대신 월드모델 예측으로 한다(훨씬 빠름, 근사)",
+    )
     args = parser.parse_args(argv)
 
     state = PlatformState(
@@ -686,10 +776,10 @@ def main(argv=None) -> int:
         device=torch.device(args.device),
         candidates=args.candidates,
         horizon=args.horizon,
+        world_model_checkpoint=args.world_model_checkpoint,
     )
-    server = ThreadingHTTPServer((args.host, args.port), _make_handler(state))
-    print(f"지휘관 플랫폼: http://{args.host}:{args.port}/  맵 {len(state.maps)}개, 후보 {args.candidates}개")
-    server.serve_forever()
+    print(f"지휘관 플랫폼: http://{args.host}:{args.port}/  (API 문서 /docs)")
+    uvicorn.run(create_app(state), host=args.host, port=args.port, log_level="warning")
     return 0
 
 
