@@ -36,6 +36,7 @@ from hackerthon.worldmodel.slots import (
     ObjectType,
     build_slot_batch_from_v2_run,
     load_v2_config,
+    mission_type_from_config,
     objective_from_config,
 )
 
@@ -191,6 +192,7 @@ def measure_tick(
         base_time_sec=time_sec,
         episode_duration_sec=duration_sec,
         objective=objective_from_config(load_v2_config(run_dir)),
+        mission_type=mission_type_from_config(load_v2_config(run_dir)),
     )
     devs_features = rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
     jepa_features = rollout_with_world_model(
