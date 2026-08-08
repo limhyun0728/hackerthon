@@ -9,21 +9,32 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import torch
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from hackerthon.terrain import WORLD_X_MAX, WORLD_X_MIN, WORLD_Y_MAX, WORLD_Y_MIN
+from hackerthon.terrain import (
+    WORLD_X_MAX,
+    WORLD_X_MIN,
+    WORLD_Y_MAX,
+    WORLD_Y_MIN,
+    cell_of,
+    component_points,
+    largest_free_component,
+)
 from hackerthon.worldmodel.actions import ACTION_DIM, ActionType, NO_COMMAND_TYPE_ID, NO_TARGET_ENTITY_ID
 from hackerthon.worldmodel.evaluator import BLUE_MAX_STEP_PER_SEC, EvaluatorWeights
 from hackerthon.worldmodel.slots import (
+    ObjectType,
     MAX_FEATURE_DIM,
     MISSION_DESTROY_ALL,
     MISSION_DESTROY_AND_REACH,
@@ -69,6 +80,21 @@ MISSION_SCORE_SCALES: dict[int, tuple[float, float, float]] = {
 }
 ACTION_TYPE_COUNT = len(ActionType)
 DEFAULT_ACTION_PRIOR = (0.20, 0.50, 0.25, 0.05)
+# 후보별 액션 성향을 뽑는 Dirichlet 농도. 방향은 전체 평균 비율, 크기는 후보 간 퍼짐을
+# 정한다 (작을수록 극단적인 후보가 많아진다). Sigma alpha = 1.0에서 교전태세 5칸이
+# 20/22/25/18/15로 거의 균등하게 찬다.
+CANDIDATE_MIX_ALPHA = (0.25, 0.45, 0.28, 0.02)
+# 직전 액션을 그대로 이어갈 확률 범위. 후보마다 뽑아 구간 길이를 다양하게 만든다.
+STICKINESS_RANGE = (0.3, 0.8)
+# 후보가 향할 목적. 이 비율로 뽑는다. 자유공간 균등 추출만 쓰면 방향이 매 구간
+# 바뀌어 유닛이 제자리를 맴돈다 — 실측에서 목표까지 17.9유닛을 60초 동안 거의
+# 못 좁혔다(규칙 정책은 5.0까지 접근). 후보마다 목적을 하나 정해 그쪽으로 가중한다.
+GOAL_WEIGHTS = (0.45, 0.35, 0.20)   # 목표 지점 / 최근접 적 / 무작위 자유점
+# 목적 지향 강도. 작을수록 직진, 클수록 탐색. 후보마다 뽑아 둘 다 나오게 한다.
+GOAL_TEMPERATURE_RANGE = (0.5, 6.0)
+# 0이면 목적 가중을 끄고 예산 안 자유공간에서 균등 추출한다(이전 동작).
+# 같은 코드로 켠 실험과 끈 실험을 나란히 돌리기 위한 스위치다.
+GOAL_DIRECTED = os.environ.get("CEM_GOAL_DIRECTED", "1") not in ("0", "false", "False")
 NO_ALIVE_BLUE_DISTANCE = math.hypot(WORLD_X_MAX - WORLD_X_MIN, WORLD_Y_MAX - WORLD_Y_MIN)
 
 
@@ -311,6 +337,294 @@ def _normalized_probability(values: torch.Tensor) -> torch.Tensor:
     return (values / total).float()
 
 
+# MOVE 한 스텝의 최대 이동거리(유닛). devs_rollout의 next_waypoint max_step과 같아야 한다.
+MAX_MOVE_PER_STEP = 1.5
+# 자유공간 후보점 캐시. 맵마다 largest_free_component가 비싸서 장애물 서명으로 재사용한다.
+_FREE_POINT_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _obstacles_from_batch(current_batch: SlotBatch) -> list[tuple[float, float, float, float]]:
+    """slot batch의 terrain feature에서 AABB 장애물을 복원한다."""
+    rects: list[tuple[float, float, float, float]] = []
+    for index, type_id in enumerate(current_batch.type_ids):
+        if int(type_id) != int(ObjectType.TERRAIN):
+            continue
+        f = current_batch.features[index]
+        cx = float(f[1]) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + (WORLD_X_MAX + WORLD_X_MIN) * 0.5
+        cy = float(f[2]) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + (WORLD_Y_MAX + WORLD_Y_MIN) * 0.5
+        w = float(f[3]) * (WORLD_X_MAX - WORLD_X_MIN)
+        h = float(f[4]) * (WORLD_Y_MAX - WORLD_Y_MIN)
+        rects.append((cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0))
+    return rects
+
+
+def _free_points(current_batch: SlotBatch) -> np.ndarray:
+    """이동 가능한 자유공간 격자점 (M, 2). 맵당 한 번만 계산한다."""
+    rects = _obstacles_from_batch(current_batch)
+    key = tuple(round(v, 3) for rect in rects for v in rect)
+    cached = _FREE_POINT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    points = component_points(largest_free_component(rects))
+    array = np.asarray(points, dtype=np.float32) if points else np.zeros((0, 2), dtype=np.float32)
+    _FREE_POINT_CACHE[key] = array
+    return array
+
+
+def _sample_structured_action_types(
+    *,
+    base_probs: torch.Tensor,
+    candidates: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    """후보마다 성향과 국면을 달리해 액션 종류 시퀀스를 만든다.
+
+    고정 prior에서 스텝/유닛마다 독립 추출하면, 유닛 5명 x 6스텝 = 30회 추출의 큰 수
+    법칙으로 **집계 비율이 prior 평균에 몰린다.** 실측에서 후보의 79%가 교전태세 격자
+    한 칸에 들어가 MAP-Elites가 사실상 1칸만 쓴다. prior 값을 바꿔도 몰리는 위치만
+    옮겨갈 뿐 퍼지지 않는다.
+
+    그래서 세 가지를 후보 단위로 뽑는다.
+
+    - 시작/끝 분포를 Dirichlet에서 각각 뽑아 **후보 간 비율을 퍼뜨린다.**
+      어떤 후보는 기동 위주, 어떤 후보는 교전 위주가 된다.
+    - 두 분포를 스텝에 걸쳐 보간해 **국면 순서를 만든다.** 시작이 MOVE 우세,
+      끝이 ENGAGE 우세면 "접근 후 교전"이 자연히 나온다. 전술 어휘를 손으로
+      정하지 않고 두 끝점 추출에서 나오게 한다.
+    - 점착도를 뽑아 **구간 길이를 다양하게 한다.** 보간만으로는 스텝별 추출이 여전히
+      독립이라 구간이 안 길어진다. 직전 액션을 확률 s로 이어가야 늘어난다.
+
+    base_probs는 CEM 반복이 갱신한 분포다. 첫 반복에서는 균등에 가깝고, 반복이
+    진행되면 elite 쪽으로 좁혀진다. 여기서 뽑은 후보별 성향을 base_probs와 곱해
+    CEM의 학습 결과를 버리지 않는다.
+    """
+    horizon, num_units, num_types = base_probs.shape
+
+    # Dirichlet은 numpy로 뽑는다. torch._standard_gamma는 generator를 안 받아 전역
+    # RNG를 쓰고, 그러면 같은 seed로도 결과가 달라져 학습이 재현되지 않는다.
+    # u^(1/a)*Exp(1) 근사는 a<1에서도 정확하지 않아(평균이 5%쯤 어긋난다) 쓰지 않는다.
+    numpy_seed = int(
+        torch.randint(0, 2**31 - 1, (1,), generator=generator, device=device).item()
+    )
+    rng = np.random.default_rng(numpy_seed)
+    alpha_np = np.asarray(CANDIDATE_MIX_ALPHA, dtype=np.float64)
+
+    def draw_mix() -> torch.Tensor:
+        drawn = rng.dirichlet(alpha_np, size=candidates)
+        return torch.as_tensor(drawn, dtype=torch.float32, device=device)
+
+    start_mix = draw_mix()
+    end_mix = draw_mix()
+    steps = torch.linspace(0.0, 1.0, horizon, device=device).reshape(1, horizon, 1)
+    # (C, H, T) 후보별 국면 분포
+    phase = start_mix.unsqueeze(1) + steps * (end_mix - start_mix).unsqueeze(1)
+    phase = phase.clamp_min(1e-6)
+
+    # base_probs를 그대로 곱하면 기존 prior(DEFAULT_ACTION_PRIOR) 쪽으로 끌려가
+    # 후보 평균이 CANDIDATE_MIX_ALPHA와 어긋난다. 초기 prior 대비 "비"만 곱해
+    # CEM 반복이 갱신한 정보만 반영한다. 첫 반복에서는 비가 1이라 순수 Dirichlet이고,
+    # engage hard mask가 0으로 만든 항목은 비도 0이라 마스크가 유지된다.
+    prior = torch.tensor(DEFAULT_ACTION_PRIOR, dtype=torch.float32, device=device)
+    modulation = base_probs / prior.reshape(1, 1, num_types).clamp_min(1e-8)
+    combined = phase.unsqueeze(2) * modulation.reshape(1, horizon, num_units, num_types)
+    combined = combined.clamp_min(1e-8)
+    combined = combined / combined.sum(dim=-1, keepdim=True)
+
+    low, high = STICKINESS_RANGE
+    stickiness = low + (high - low) * torch.rand(
+        (candidates, 1), generator=generator, device=device
+    )
+
+    result = torch.zeros((candidates, horizon, num_units), dtype=torch.long, device=device)
+    previous: torch.Tensor | None = None
+    for step in range(horizon):
+        flat = combined[:, step].reshape(candidates * num_units, num_types)
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(
+            candidates, num_units
+        )
+        if previous is None:
+            current = sampled
+        else:
+            keep = torch.rand((candidates, num_units), generator=generator, device=device) < stickiness
+            current = torch.where(keep, previous, sampled)
+        result[:, step] = current
+        previous = current
+    return result
+
+
+def _sample_free_within(
+    anchor: torch.Tensor,
+    budget: torch.Tensor,
+    free_tensor: torch.Tensor,
+    generator: torch.Generator,
+    *,
+    goal: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor:
+    """anchor에서 budget 안 자유공간 점을 목적 쪽으로 가중해 뽑는다.
+
+    자유공간 점을 뽑은 뒤 거리로 자르면 안 된다 — 잘린 지점이 건물 안에 떨어진다.
+    거리순으로 정렬해 두고 예산 안에 드는 앞쪽 구간에서만 고른다.
+
+    그 구간에서 균등하게 뽑으면 방향이 매번 바뀌어 유닛이 제자리를 맴돈다. 목적까지
+    거리에 exp(-d / tau) 가중을 준다. tau가 작으면 직진, 크면 탐색이라 후보마다
+    성격이 갈린다.
+    """
+    device = free_tensor.device
+    flat_anchor = anchor.reshape(-1, 2)
+    distance = torch.cdist(flat_anchor.unsqueeze(0), free_tensor.unsqueeze(0)).squeeze(0)
+    within = distance <= budget.reshape(-1, 1)
+    # 예산 안에 하나도 없으면 가장 가까운 점을 허용해 항상 뽑을 수 있게 한다.
+    nearest = distance.argmin(dim=1, keepdim=True)
+    within.scatter_(1, nearest, True)
+
+    to_goal = torch.cdist(goal.reshape(-1, 2).unsqueeze(0), free_tensor.unsqueeze(0)).squeeze(0)
+    tau = temperature.reshape(-1, 1)
+    logits = (-to_goal / tau.clamp_min(1e-3)) if GOAL_DIRECTED else torch.zeros_like(to_goal)
+    logits = logits.masked_fill(~within, -float("inf"))
+    weight = torch.softmax(logits, dim=1)
+    picked = torch.multinomial(weight, 1, generator=generator).squeeze(1)
+    return free_tensor.index_select(0, picked).reshape(anchor.shape)
+
+
+def _sample_reachable_move_targets(
+    *,
+    current_batch: SlotBatch,
+    blue_indices: torch.Tensor,
+    action_type_ids: torch.Tensor,
+    issued_mask: torch.Tensor,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """MOVE 목적지를 연속 MOVE 구간마다 하나씩, 그 시점 위치 기준으로 뽑는다.
+
+    기존 prior는 목표까지 직선 보간에 가우시안을 얹어, 목적지의 37%가 건물 안이고
+    43%만 도달 가능했다. 절반 넘는 후보가 next_waypoint에서 STOP으로 떨어져 낭비되고,
+    모든 후보가 같은 방향(목표)으로 향해 다양성도 안 나온다.
+
+    **기준점은 그 시점의 위치여야 한다.** 6개 목적지를 전부 계획 시작 위치 기준으로
+    뽑으면, 세 번째 MOVE의 목적지를 "시작 위치에서 4.5유닛" 안에서 고르게 되는데
+    그때 유닛은 이미 다른 곳에 있다. 기준점이 틀린 샘플이다.
+
+    **연속 MOVE 구간은 목적지 하나를 공유한다.** MOVE,MOVE,MOVE면 그 시점 위치에서
+    4.5유닛 안의 한 점을 골라 세 스텝 동안 그리로 간다. 스텝마다 다른 점을 뽑으면
+    유닛이 갈지자로 흔들려 "우회 기동" 같은 안이 나오지 않는다.
+
+    ENGAGE나 STOP이 끼면 그 스텝에는 이동하지 않으므로 예산이 늘지 않는다. 구간이
+    끊기고 다음 MOVE 구간은 도착 지점에서 새로 시작한다.
+
+    반환 None은 자유공간 정보를 못 얻은 경우이고, 호출부가 기존 방식으로 되돌린다.
+    """
+    free = _free_points(current_batch)
+    if free.shape[0] == 0:
+        return None
+
+    features = torch.as_tensor(current_batch.features, device=device).float()
+    normalized = features.index_select(0, blue_indices)[:, [UNIT_X_INDEX, UNIT_Y_INDEX]]
+    start = torch.stack(
+        [
+            (normalized[:, 0] + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
+            (normalized[:, 1] + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
+        ],
+        dim=-1,
+    )
+    candidates, horizon, num_units = action_type_ids.shape
+    free_tensor = torch.as_tensor(free, device=device)
+
+    # 후보마다 목적 하나와 지향 강도를 뽑는다. 같은 후보 안에서는 방향이 일관되고
+    # 후보 사이에서는 갈린다. 6스텝 커밋이 그래야 "한 목적을 향해 나아가는 6초"가
+    # 되고, 무작위 방향으로 6초를 밀어붙이는 일이 없어진다.
+    features_all = torch.as_tensor(current_batch.features, device=device).float()
+    type_ids_all = torch.as_tensor(current_batch.type_ids, device=device).long()
+    mission_index = int(torch.argmax((type_ids_all == int(ObjectType.MISSION)).long()).item())
+    objective_xy = torch.stack(
+        [
+            (features_all[mission_index, MISSION_OBJECTIVE_X_INDEX] + 1.0) * 0.5
+            * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
+            (features_all[mission_index, MISSION_OBJECTIVE_Y_INDEX] + 1.0) * 0.5
+            * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
+        ]
+    )
+    _, red_xy_norm = red_target_table(current_batch, device=device)
+    if red_xy_norm.numel() > 0:
+        red_xy = torch.stack(
+            [
+                (red_xy_norm[:, 0] + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
+                (red_xy_norm[:, 1] + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
+            ],
+            dim=-1,
+        )
+    else:
+        red_xy = objective_xy.reshape(1, 2)
+
+    goal_probs = torch.tensor(GOAL_WEIGHTS, dtype=torch.float32, device=device)
+    goal_kind = torch.multinomial(
+        goal_probs.expand(candidates, len(GOAL_WEIGHTS)), 1, generator=generator
+    ).squeeze(-1)
+    low, high = GOAL_TEMPERATURE_RANGE
+    temperature = low + (high - low) * torch.rand(
+        (candidates,), generator=generator, device=device
+    )
+
+    is_move = (action_type_ids == int(ActionType.MOVE)) & issued_mask
+
+    # 각 스텝에서 시작하는 연속 MOVE 구간의 길이. 뒤에서부터 누적한다.
+    run_length = torch.zeros_like(is_move, dtype=torch.float32)
+    for step in range(horizon - 1, -1, -1):
+        following = run_length[:, step + 1] if step + 1 < horizon else 0.0
+        run_length[:, step] = torch.where(
+            is_move[:, step], 1.0 + following, torch.zeros_like(run_length[:, step])
+        )
+    previous_move = torch.cat(
+        [torch.zeros_like(is_move[:, :1]), is_move[:, :-1]], dim=1
+    )
+    run_start = is_move & ~previous_move
+
+    anchor = start.reshape(1, num_units, 2).expand(candidates, num_units, 2).contiguous()
+    current_target = anchor.clone()
+    targets = torch.zeros((candidates, horizon, num_units, 2), dtype=torch.float32, device=device)
+
+    # 유닛별 목적 좌표. 무작위 목적(kind 2)은 자유공간에서 뽑아 유닛마다 다르게 둔다.
+    goal = objective_xy.reshape(1, 1, 2).expand(candidates, num_units, 2).clone()
+    nearest = red_xy[
+        torch.cdist(start.unsqueeze(0), red_xy.unsqueeze(0)).squeeze(0).argmin(dim=1)
+    ]
+    goal[goal_kind == 1] = nearest.reshape(1, num_units, 2).expand(candidates, num_units, 2)[
+        goal_kind == 1
+    ]
+    scatter = free_tensor.index_select(
+        0,
+        torch.randint(
+            0, free_tensor.shape[0], (candidates * num_units,), generator=generator, device=device
+        ),
+    ).reshape(candidates, num_units, 2)
+    goal[goal_kind == 2] = scatter[goal_kind == 2]
+
+    for step in range(horizon):
+        budget = run_length[:, step] * MAX_MOVE_PER_STEP
+        sampled = _sample_free_within(
+            anchor,
+            budget,
+            free_tensor,
+            generator,
+            goal=goal,
+            # 온도는 후보 단위이고 anchor는 (후보 x 유닛)이라 유닛 축으로 펼친다.
+            temperature=temperature.reshape(-1, 1).expand(candidates, num_units),
+        )
+        begin = run_start[:, step].unsqueeze(-1)
+        current_target = torch.where(begin, sampled, current_target)
+        targets[:, step] = current_target
+        # 구간의 마지막 스텝이면 도착 지점이 다음 구간의 기준점이 된다.
+        next_move = is_move[:, step + 1] if step + 1 < horizon else torch.zeros_like(is_move[:, step])
+        finished = (is_move[:, step] & ~next_move).unsqueeze(-1)
+        anchor = torch.where(finished, current_target, anchor)
+
+    norm_x = (targets[..., 0] - WORLD_X_MIN) / (WORLD_X_MAX - WORLD_X_MIN) * 2.0 - 1.0
+    norm_y = (targets[..., 1] - WORLD_Y_MIN) / (WORLD_Y_MAX - WORLD_Y_MIN) * 2.0 - 1.0
+    return _clip_move_xy(torch.stack([norm_x, norm_y], dim=-1))
+
+
 def _clip_move_xy(values: torch.Tensor) -> torch.Tensor:
     """정규화 좌표를 [-1, 1] 범위로 제한한다."""
     return torch.clamp(values, -1.0, 1.0).float()
@@ -427,6 +741,7 @@ def sample_future_action_plans(
     """현재 CEM 분포에서 미래 joint action 후보들을 샘플링한다."""
     unit_ids = blue_unit_ids(current_batch, device=device)
     issued_unit_mask = alive_blue_mask(current_batch, device=device)
+    blue_indices = _team_slot_indices(current_batch, TeamId.BLUE, device=device)
     red_ids, red_xy = red_target_table(current_batch, device=device)
     horizon, num_units, _ = distribution.action_probs.shape
     if horizon != config.future_horizon:
@@ -456,12 +771,28 @@ def sample_future_action_plans(
         )
     )
 
-    flat_action_probs = distribution.action_probs.reshape(horizon * num_units, ACTION_TYPE_COUNT)
-    sampled_actions = _sample_categorical(flat_action_probs, sample_count=candidates, generator=generator)
-    action_type_ids = sampled_actions.reshape(candidates, horizon, num_units)
+    action_type_ids = _sample_structured_action_types(
+        base_probs=distribution.action_probs,
+        candidates=candidates,
+        generator=generator,
+        device=device,
+    )
     flat_target_probs = distribution.target_probs.reshape(horizon * num_units, distribution.target_probs.shape[-1])
     sampled_targets = _sample_categorical(flat_target_probs, sample_count=candidates, generator=generator)
     target_indices = sampled_targets.reshape(candidates, horizon, num_units)
+
+    # MOVE 목적지를 도달 가능한 자유공간에서 다시 뽑는다. action_type_ids가 정해진
+    # 뒤라야 유닛별 이동 예산(누적 MOVE 횟수)을 알 수 있어 여기에 둔다.
+    reachable = _sample_reachable_move_targets(
+        current_batch=current_batch,
+        blue_indices=blue_indices,
+        action_type_ids=action_type_ids,
+        issued_mask=issued_mask,
+        generator=generator,
+        device=device,
+    )
+    if reachable is not None:
+        move_xy_norm = reachable
 
     action_features[..., 0] = action_type_ids.float()
     move_mask = issued_mask & (action_type_ids == int(ActionType.MOVE))

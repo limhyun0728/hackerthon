@@ -347,6 +347,12 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="불확실 원의 실제 포함률 측정")
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/devs_mixed_probe.pt"))
     parser.add_argument("--maps-root", type=Path, default=Path("output/maps"))
+    parser.add_argument(
+        "--maps",
+        nargs="+",
+        default=None,
+        help="쓸 맵 이름. 생략하면 maps-root 아래 전부. 홀드아웃 맵만 재려면 여기 지정한다",
+    )
     parser.add_argument("--scenarios", type=int, default=40)
     parser.add_argument("--candidates", type=int, default=16)
     parser.add_argument("--horizon", type=int, default=6)
@@ -358,6 +364,12 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
     map_configs = sorted(args.maps_root.glob("*/config.json"))
+    if args.maps:
+        wanted = set(args.maps)
+        map_configs = [p for p in map_configs if p.parent.name in wanted]
+        missing = wanted - {p.parent.name for p in map_configs}
+        if missing:
+            raise ValueError(f"맵을 못 찾았다: {sorted(missing)}")
     if not map_configs:
         raise ValueError(f"{args.maps_root} 아래에 맵이 없다")
     print(f"맵 {len(map_configs)}개: {', '.join(p.parent.name for p in map_configs)}")

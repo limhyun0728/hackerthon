@@ -16,7 +16,7 @@ import random
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +69,9 @@ from hackerthon.worldmodel.cem_planner import (  # noqa: E402
 )
 from hackerthon.worldmodel.devs_rollout import rollout_plans_with_devs, snapshot_from_slot_rows  # noqa: E402
 from hackerthon.worldmodel.object_slot_attention import DEVSObjectCentricWorldModel, ObjectSlotModelConfig  # noqa: E402
+from hackerthon.worldmodel.value_head import ValueHead, ValueHeadConfig, load_value_head, save_value_head  # noqa: E402
+from hackerthon.worldmodel.value_online import OnlineValueTrainer, mission_progress  # noqa: E402
+from hackerthon.worldmodel.value_scoring import make_value_score_fn  # noqa: E402
 from hackerthon.worldmodel.policy_head import (  # noqa: E402
     MOVE_X_INDEX,
     MOVE_Y_INDEX,
@@ -281,6 +284,7 @@ class EpisodeResult:
     trajectory: EpisodeTrajectory
     final_rows: tuple[dict[str, object], ...]
     rollout_windows: tuple = ()
+    states_by_time: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -813,6 +817,7 @@ class CEMCommanderAtomic(AtomicDEVS):
         cem_config: CEMConfig,
         device: torch.device,
         rollout_backend: str = "jepa",
+        value_head=None,
         episode_seed: int | None = None,
         rollout_replay_per_tick: int = 0,
         rollout_replay_stride: int = 1,
@@ -856,6 +861,12 @@ class CEMCommanderAtomic(AtomicDEVS):
         if rollout_backend not in ("jepa", "devs"):
             raise ValueError("rollout_backend는 jepa 또는 devs여야 한다")
         self.rollout_backend = rollout_backend
+        # 있으면 CEM 채점을 휴리스틱 대신 V로 한다. 없으면 기존 동작 그대로.
+        self.value_head = value_head
+        # horizon 동안 유지할 현재 계획. 소진되면 다시 세운다.
+        self._active_plan = None
+        self._active_plan_step = 0
+        self._active_plan_meta = ("", 0.0, 0.0)
         self.dt = float(dt)
         # jepa rollout은 한 번의 예측 길이가 pred_frames로 고정된다. devs rollout은
         # 실제 시뮬레이션이므로 horizon을 pred_frames와 독립적으로 늘릴 수 있다.
@@ -948,10 +959,28 @@ class CEMCommanderAtomic(AtomicDEVS):
             # 모델이 외삽하게 되고, 그게 곧 계획 품질 저하로 돌아온다.
             self._collect_rule_rollout_replay(current_batch)
         else:
-            plan, selector, best_score, population_mean = self._select_plan(current_batch)
-            commands = self._commands_from_plan(plan, current_batch=current_batch, step_index=0)
+            # 계획을 horizon 동안 유지한다. 매 tick 재계획하면 6스텝 시퀀스를 뽑는 의미가
+            # 없다 — 국면(접근 후 교전)이나 연속 MOVE 구간 같은 구조가 첫 스텝만 실행되고
+            # 버려진다. 플랫폼도 지휘관이 고른 계획을 6초 동안 그대로 집행하므로,
+            # 학습을 매 tick으로 두면 데이터가 실제 실행 방식과 다른 분포에서 나온다.
+            horizon = int(self.cem_config.future_horizon)
+            if self._active_plan is None or self._active_plan_step >= horizon:
+                plan, selector, best_score, population_mean = self._select_plan(current_batch)
+                self._active_plan = plan
+                self._active_plan_step = 0
+                self._active_plan_meta = (selector, best_score, population_mean)
+            plan = self._active_plan
+            selector, best_score, population_mean = self._active_plan_meta
+            commands = self._commands_from_plan(
+                plan, current_batch=current_batch, step_index=self._active_plan_step
+            )
+            self._active_plan_step += 1
             self._record_commands(
-                current_time, commands, selector=selector, best_score=best_score, population_mean=population_mean
+                current_time,
+                commands,
+                selector=selector,
+                best_score=best_score,
+                population_mean=population_mean,
             )
 
         out = {}
@@ -1346,7 +1375,19 @@ class CEMCommanderAtomic(AtomicDEVS):
 
         plans = holder["plans"]
         features = holder["features"]
-        scores = score_future_features_torch(current_batch=current_batch, future_features=features)
+        # replay 회수도 액션 선택과 같은 기준으로 고른다. 기준이 다르면 학습에 들어가는
+        # window와 실제로 실행된 액션의 성격이 어긋난다.
+        if self.value_head is not None:
+            scores = make_value_score_fn(
+                value_head=self.value_head,
+                current_batch=current_batch,
+                mission_type=self.mission_type,
+                device=self.device,
+            )(features)
+        else:
+            scores = score_future_features_torch(
+                current_batch=current_batch, future_features=features
+            )
         count = min(self.rollout_replay_per_tick, int(scores.shape[0]))
         top_count = max(1, count // 2)
         order = torch.argsort(scores, descending=True)
@@ -1414,8 +1455,18 @@ class CEMCommanderAtomic(AtomicDEVS):
         else:
             rollout_fn = self._jepa_rollout_fn(current_batch)
 
-        def score_fn(future_features):
-            return score_future_features_torch(current_batch=current_batch, future_features=future_features)
+        if self.value_head is not None:
+            score_fn = make_value_score_fn(
+                value_head=self.value_head,
+                current_batch=current_batch,
+                mission_type=self.mission_type,
+                device=self.device,
+            )
+        else:
+            def score_fn(future_features):
+                return score_future_features_torch(
+                    current_batch=current_batch, future_features=future_features
+                )
 
         result = optimize_cem(
             current_batch=current_batch,
@@ -1693,6 +1744,7 @@ class CEMEpisodeBattleModel(CoupledDEVS):
         cem_config: CEMConfig,
         device: torch.device,
         rollout_backend: str = "jepa",
+        value_head=None,
         rollout_replay_per_tick: int = 0,
         rollout_replay_stride: int = 1,
         policy: PolicyHead | None = None,
@@ -1740,6 +1792,7 @@ class CEMEpisodeBattleModel(CoupledDEVS):
                 cem_config=cem_config,
                 device=device,
                 rollout_backend=rollout_backend,
+                value_head=value_head,
                 episode_seed=seed,
                 mission_type=mission_type,
                 blue_controller=blue_controller,
@@ -2106,6 +2159,7 @@ def run_episode(
     device: torch.device,
     obstacles: Sequence[Sequence[float]] = DEFAULT_OBSTACLES,
     rollout_backend: str = "jepa",
+    value_head=None,
     rollout_replay_per_tick: int = 0,
     rollout_replay_stride: int = 1,
     policy: PolicyHead | None = None,
@@ -2152,6 +2206,7 @@ def run_episode(
         cem_config=cem_config,
         device=device,
         rollout_backend=rollout_backend,
+        value_head=value_head,
         rollout_replay_per_tick=rollout_replay_per_tick,
         rollout_replay_stride=rollout_replay_stride,
         policy=policy,
@@ -2199,6 +2254,7 @@ def run_episode(
         trajectory=trajectory,
         final_rows=latest_rows,
         rollout_windows=tuple(battle.commander.rollout_windows),
+        states_by_time=dict(battle.commander._states_by_time),
     )
 
 
@@ -2474,6 +2530,41 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
         help="학습에 사용하지 않는 고정 DEVS validation episode 디렉터리. 여러 번 지정 가능",
     )
     parser.add_argument("--validation-every", type=int, default=5, help="몇 episode마다 validation할지")
+    parser.add_argument(
+        "--value-head-checkpoint",
+        type=Path,
+        default=None,
+        help="주면 CEM 채점을 휴리스틱 대신 이 value head로 한다. "
+        "--blue-controller cem --cem-rollout devs 와 함께 쓰는 것이 의도된 조합이다 "
+        "(DEVS로 정확히 굴리고 끝 상태만 V로 평가하므로 월드모델 오차가 개입하지 않는다)",
+    )
+    parser.add_argument("--value-epochs-per-episode", type=int, default=3)
+    parser.add_argument("--value-batch-size", type=int, default=32)
+    parser.add_argument("--value-samples-per-episode", type=int, default=10)
+    parser.add_argument("--value-buffer-episodes", type=int, default=30)
+    parser.add_argument(
+        "--value-min-episodes",
+        type=int,
+        default=10,
+        help="이만큼 쌓이기 전에는 V가 미숙해 CEM 채점에 쓰지 않고 휴리스틱을 쓴다",
+    )
+    parser.add_argument("--value-head-output-path", type=Path, default=None)
+    parser.add_argument("--value-learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--early-stop-min-ratio",
+        type=float,
+        default=0.0,
+        help="이전 best 대비 이 비율만큼 줄어야 개선으로 인정한다 (0.005 = 0.5%%). "
+        "검증 잡음으로 우연히 낮게 나온 회차를 best로 잡는 것을 막는다. "
+        "절대값 기준인 --early-stop-min-delta와 함께 쓰면 둘 다 만족해야 한다",
+    )
+    parser.add_argument(
+        "--checkpoint-archive-every",
+        type=int,
+        default=0,
+        help="N episode마다 가중치를 별도 파일(_ep0010.pt 등)로 보관한다. 0이면 끄기. "
+        "latest/best는 같은 경로를 계속 덮으므로, 나중에 특정 시점으로 되돌리려면 필요하다",
+    )
     parser.add_argument("--validation-batch-size", type=int, default=64)
     parser.add_argument("--validation-seed", type=int, default=1234, help="validation masking 고정 seed")
     parser.add_argument(
@@ -2537,6 +2628,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         raise ValueError("--validation-max-windows는 음수일 수 없다")
     if args.early_stop_patience < 0:
         raise ValueError("--early-stop-patience는 음수일 수 없다")
+    if args.early_stop_min_ratio < 0.0:
+        raise ValueError("--early-stop-min-ratio는 음수일 수 없다")
     if args.early_stop_min_delta < 0.0:
         raise ValueError("--early-stop-min-delta는 음수일 수 없다")
     if args.early_stop_min_episodes < 0:
@@ -2777,6 +2870,37 @@ def main(argv: Iterable[str] | None = None) -> None:
     if args.policy_entropy_decay_episodes < 0:
         raise ValueError("--policy-entropy-decay-episodes는 음수일 수 없다")
 
+    value_head = None
+    value_trainer = None
+    if args.blue_controller == "cem":
+        if args.value_head_checkpoint is not None:
+            value_head = load_value_head(args.value_head_checkpoint, device)
+            print(f"value head warm-start: {args.value_head_checkpoint}")
+        else:
+            value_head = ValueHead(ValueHeadConfig()).to(device)
+            print("value head 새로 시작 (checkpoint 없음)")
+        value_trainer = OnlineValueTrainer(
+            value_head=value_head,
+            device=device,
+            learning_rate=args.value_learning_rate,
+            epochs_per_episode=args.value_epochs_per_episode,
+            batch_size=args.value_batch_size,
+            samples_per_episode=args.value_samples_per_episode,
+            buffer_episodes=args.value_buffer_episodes,
+            min_episodes=args.value_min_episodes,
+            seed=args.seed,
+        )
+        value_output_path = args.value_head_output_path or args.checkpoint_path.with_name(
+            f"{args.checkpoint_path.stem}_value.pt"
+        )
+        print(
+            f"value head 온라인 학습: epochs={args.value_epochs_per_episode} "
+            f"batch={args.value_batch_size} buffer={args.value_buffer_episodes}ep "
+            f"min={args.value_min_episodes}ep save={value_output_path}"
+        )
+        if args.cem_rollout != "devs":
+            print("  경고: --cem-rollout이 devs가 아니라 월드모델 오차가 채점에 섞인다")
+
     policy = None
     policy_optimizer = None
     policy_ready = False
@@ -2913,6 +3037,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             rollout_replay_stride=args.rollout_replay_stride,
             policy=policy if policy_active else None,
             policy_prior_mix=policy_prior_mix,
+            value_head=value_head,
             red_target_priority=args.red_target_priority,
             write_csv_logs=not args.disable_csv_logs,
             obstacle_config=obstacle_config,
@@ -2951,6 +3076,29 @@ def main(argv: Iterable[str] | None = None) -> None:
             # JEPA rollout 평가기는 고정해 policy 변화만 관찰한다.
             model.eval()
         else:
+            if value_trainer is not None:
+                summary_row = _episode_summary(result, objective=CURRENT_OBJECTIVE)
+                progress = mission_progress(
+                    mission_type=episode_mission_type,
+                    blue_alive=int(summary_row["blue_alive"]),
+                    red_hp=float(summary_row["red_hp"]),
+                    red_initial=len(RED_IDS),
+                    objective_distance=float(summary_row["objective_distance"]),
+                )
+                added = value_trainer.add_episode(
+                    states_by_time=result.states_by_time,
+                    mission_type=episode_mission_type,
+                    progress=progress,
+                    horizon=effective_cem_config.future_horizon,
+                )
+                value_metrics = value_trainer.train()
+                save_value_head(value_output_path, value_head)
+                print(
+                    f"value_head episode={episode_index} progress={progress:.3f} "
+                    f"added={added} buffer={int(value_metrics['samples'])} "
+                    f"steps={int(value_metrics['steps'])} mae={value_metrics['mae']:.4f}"
+                )
+
             train_metrics, global_step = train_existing_model(
                 model=model,
                 optimizer=optimizer,
@@ -2974,7 +3122,15 @@ def main(argv: Iterable[str] | None = None) -> None:
                     validation_seed=args.validation_seed,
                 )
                 validation_value = float(getattr(validation_metrics, args.validation_monitor))
-                improved = validation_value < best_validation_value - args.early_stop_min_delta
+                # 개선 문턱. 절대값과 비율을 모두 넘어야 인정한다. 비율 기준은
+                # 검증 잡음(신호/잡음 1~7)으로 우연히 낮게 나온 회차를 best로
+                # 붙잡는 것을 막는다. best가 inf인 첫 회차는 비율을 적용하지 않는다.
+                threshold = best_validation_value - args.early_stop_min_delta
+                if math.isfinite(best_validation_value) and args.early_stop_min_ratio > 0.0:
+                    threshold = min(
+                        threshold, best_validation_value * (1.0 - args.early_stop_min_ratio)
+                    )
+                improved = validation_value < threshold
                 if improved:
                     best_validation_value = validation_value
                     bad_validation_checks = 0
@@ -3022,6 +3178,36 @@ def main(argv: Iterable[str] | None = None) -> None:
                     best_episode=best_episode,
                     bad_validation_checks=bad_validation_checks,
                 )
+                # 주기 보관본. latest/best는 같은 경로를 덮으므로, 검증 잡음 때문에
+                # 잘못 고른 best를 나중에 되짚으려면 시점별 파일이 있어야 한다.
+                if args.checkpoint_archive_every > 0 and (
+                    episode_index % args.checkpoint_archive_every == 0
+                ):
+                    archive_path = args.checkpoint_path.with_name(
+                        f"{args.checkpoint_path.stem}_ep{episode_index:04d}"
+                        f"{args.checkpoint_path.suffix}"
+                    )
+                    save_checkpoint(
+                        path=archive_path,
+                        model=model,
+                        optimizer=optimizer,
+                        model_config=model_config,
+                        optimizer_config=optimizer_config,
+                        loss_weights=loss_weights,
+                        epoch=completed_epochs,
+                        global_step=global_step,
+                        metrics=train_metrics,
+                        episode=episode_index,
+                        checkpoint_kind="archive",
+                        validation_metrics=validation_metrics,
+                        validation_monitor=args.validation_monitor,
+                        validation_value=validation_value,
+                        best_validation_value=best_validation_value,
+                        best_episode=best_episode,
+                        bad_validation_checks=bad_validation_checks,
+                    )
+                    print(f"checkpoint_archive={archive_path}")
+
                 validation_row = {
                     "episode": episode_index,
                     "epoch": completed_epochs,
