@@ -613,9 +613,16 @@ class CausalMaskedObjectPredictor(nn.Module):
         static_index: torch.Tensor | None = None
         if STATIC_TERRAIN_KV and type_ids is not None:
             # 배치 안 slot layout이 같다는 것은 _validate_batch_layout이 보장한다.
-            is_unit = type_ids[0] == int(ObjectType.UNIT)
+            #
+            # 임무는 query에 남긴다. mission feature에 time_remaining_ratio(매 프레임
+            # 감소)와 completion_flag(전투 결과에 따라 바뀜)가 있어 정지 객체가 아니다.
+            # slot이 하나뿐이라 query에 둬도 비용이 6%(강남역 144 -> 153)만 늘고,
+            # 지형 140개를 빼는 효과에 비하면 무시할 수준이다.
+            is_dynamic = (type_ids[0] == int(ObjectType.UNIT)) | (
+                type_ids[0] == int(ObjectType.MISSION)
+            )
             is_query = torch.ones(total_token_slots, dtype=torch.bool, device=model_input.device)
-            is_query[:num_object_slots] = is_unit
+            is_query[:num_object_slots] = is_dynamic
             if not bool(is_query.all()):
                 static_index = torch.nonzero(~is_query, as_tuple=False).flatten()
                 query_index = torch.nonzero(is_query, as_tuple=False).flatten()
@@ -968,13 +975,15 @@ def cjepa_prediction_loss(
         _expect_rank("type_ids", type_ids, 2)
         if type_ids.shape[0] != pred_tokens.shape[0] or type_ids.shape[1] != pred_tokens.shape[2]:
             raise ValueError("type_ids shape는 (B, N)이어야 한다")
-        is_unit = (type_ids == int(ObjectType.UNIT)).reshape(
-            type_ids.shape[0], 1, type_ids.shape[1], 1
-        )
-        weight = is_unit.to(future_pred.dtype)
+        # 임무도 예측 대상이라 포함한다 — time_remaining_ratio와 completion_flag가
+        # 프레임마다 변한다. slot 1개라 희석은 무시할 수준이다.
+        is_dynamic = (
+            (type_ids == int(ObjectType.UNIT)) | (type_ids == int(ObjectType.MISSION))
+        ).reshape(type_ids.shape[0], 1, type_ids.shape[1], 1)
+        weight = is_dynamic.to(future_pred.dtype)
         total = weight.sum() * future_pred.shape[1] * future_pred.shape[-1]
         if float(total) <= 0.0:
-            raise ValueError("unit slot이 하나도 없어 future 손실을 낼 수 없다")
+            raise ValueError("unit/mission slot이 하나도 없어 future 손실을 낼 수 없다")
         future_loss = (((future_pred - future_target) ** 2) * weight).sum() / total
     else:
         future_loss = F.mse_loss(future_pred, future_target)
@@ -1670,9 +1679,10 @@ class DEVSObjectCentricWorldModel(nn.Module):
             type_ids=history_type_ids[:, 0],
         )
         future_type_ids = full_type_ids[:, self.config.history_frames:total_frames]
-        # 미래 프레임은 unit slot만 디코딩한다. 지형과 임무는 정지 물체라 미래가 이미
-        # 알려져 있고, 예측하는 것보다 마지막 관측값을 그대로 쓰는 편이 정확하다.
-        # 0으로 두면 안 된다 — value head가 mission slot에서 목표 좌표를 읽는다.
+        # 미래 프레임은 unit과 mission만 디코딩한다. 지형은 정지 물체라 미래가 이미
+        # 알려져 있고, 예측하는 것보다 마지막 관측값을 쓰는 편이 정확하다. 임무는
+        # time_remaining_ratio와 completion_flag가 변하므로 예측 대상으로 남긴다.
+        # 지형을 0으로 두면 안 된다 — value head의 attention 문맥에 들어간다.
         future_features = self.state_decoder(
             future_tokens.reshape(
                 batch_size * self.config.pred_frames,
@@ -1680,11 +1690,11 @@ class DEVSObjectCentricWorldModel(nn.Module):
                 self.config.embedding_dim,
             ),
             future_type_ids.reshape(batch_size * self.config.pred_frames, num_slots),
-            only_types=(ObjectType.UNIT,),
+            only_types=(ObjectType.UNIT, ObjectType.MISSION),
         ).reshape(batch_size, self.config.pred_frames, num_slots, MAX_FEATURE_DIM)
-        is_unit = (future_type_ids == int(ObjectType.UNIT)).unsqueeze(-1)
+        is_terrain = (future_type_ids == int(ObjectType.TERRAIN)).unsqueeze(-1)
         static_features = history_features[:, -1].unsqueeze(1).expand_as(future_features)
-        future_features = torch.where(is_unit, future_features, static_features)
+        future_features = torch.where(is_terrain, static_features, future_features)
         return {
             "history_tokens": history_tokens,
             "action_tokens": action_tokens,
