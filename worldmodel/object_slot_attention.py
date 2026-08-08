@@ -1053,8 +1053,20 @@ class ObjectStateDecoder(nn.Module):
         self.terrain_decoder = _mlp(dim, config.hidden_dim, len(TERRAIN_FEATURE_NAMES), config.dropout)
         self.mission_decoder = _mlp(dim, config.hidden_dim, len(MISSION_FEATURE_NAMES), config.dropout)
 
-    def forward(self, tokens: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
-        """타입별 decoder 출력만 padding feature의 앞쪽 차원에 채운다."""
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        type_ids: torch.Tensor,
+        *,
+        only_types: tuple[ObjectType, ...] | None = None,
+    ) -> torch.Tensor:
+        """타입별 decoder 출력만 padding feature의 앞쪽 차원에 채운다.
+
+        `only_types`를 주면 그 타입만 디코딩하고 나머지 slot은 0으로 남긴다. 미래
+        프레임에서 지형·임무를 건너뛰는 데 쓴다 — 정지 물체라 예측할 필요가 없고,
+        호출부가 알고 있는 실제 값으로 채우는 편이 더 정확하다. 채우지 않고 0으로
+        두면 안 된다: value head가 mission slot에서 목표 좌표를 읽는다.
+        """
         _expect_rank("tokens", tokens, 3)
         _expect_rank("type_ids", type_ids, 2)
         if tokens.shape[:2] != type_ids.shape:
@@ -1069,6 +1081,8 @@ class ObjectStateDecoder(nn.Module):
             (ObjectType.MISSION, len(MISSION_FEATURE_NAMES), self.mission_decoder),
         )
         for object_type, feature_dim, decoder in decoder_specs:
+            if only_types is not None and object_type not in only_types:
+                continue
             selected = type_ids == int(object_type)
             if torch.any(selected):
                 decoded[selected, :feature_dim] = decoder(tokens[selected])
@@ -1538,6 +1552,9 @@ class DEVSObjectCentricWorldModel(nn.Module):
             action_tokens=action_tokens,
         )
         future_type_ids = full_type_ids[:, self.config.history_frames:total_frames]
+        # 미래 프레임은 unit slot만 디코딩한다. 지형과 임무는 정지 물체라 미래가 이미
+        # 알려져 있고, 예측하는 것보다 마지막 관측값을 그대로 쓰는 편이 정확하다.
+        # 0으로 두면 안 된다 — value head가 mission slot에서 목표 좌표를 읽는다.
         future_features = self.state_decoder(
             future_tokens.reshape(
                 batch_size * self.config.pred_frames,
@@ -1545,7 +1562,11 @@ class DEVSObjectCentricWorldModel(nn.Module):
                 self.config.embedding_dim,
             ),
             future_type_ids.reshape(batch_size * self.config.pred_frames, num_slots),
+            only_types=(ObjectType.UNIT,),
         ).reshape(batch_size, self.config.pred_frames, num_slots, MAX_FEATURE_DIM)
+        is_unit = (future_type_ids == int(ObjectType.UNIT)).unsqueeze(-1)
+        static_features = history_features[:, -1].unsqueeze(1).expand_as(future_features)
+        future_features = torch.where(is_unit, future_features, static_features)
         return {
             "history_tokens": history_tokens,
             "action_tokens": action_tokens,
