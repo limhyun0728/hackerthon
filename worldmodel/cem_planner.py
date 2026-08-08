@@ -28,7 +28,7 @@ from hackerthon.terrain import (
     WORLD_X_MIN,
     WORLD_Y_MAX,
     WORLD_Y_MIN,
-    cell_of,
+    astar_path,
     component_points,
     largest_free_component,
 )
@@ -42,7 +42,6 @@ from hackerthon.worldmodel.slots import (
     MISSION_REACH_OBJECTIVE,
     MISSION_HOLD_OBJECTIVE,
     OBJECTIVE_RADIUS,
-    ObjectType,
     SlotBatch,
     TeamId,
     build_slot_batch_from_v2_run,
@@ -87,14 +86,12 @@ DEFAULT_ACTION_PRIOR = (0.20, 0.50, 0.25, 0.05)
 CANDIDATE_MIX_ALPHA = (0.25, 0.45, 0.28, 0.02)
 # 직전 액션을 그대로 이어갈 확률 범위. 후보마다 뽑아 구간 길이를 다양하게 만든다.
 STICKINESS_RANGE = (0.3, 0.8)
-# MOVE 목적지는 예산 안 자유공간에서 균등 추출한다. 한때 후보마다 목적(목표 지점 /
-# 최근접 적 / 무작위 자유점)을 정하고 그쪽으로 가중했으나 제거했다 — 어디로 향할지는
-# 전술 판단이고, 제안 분포에 손으로 넣으면 "무작위 계획을 뽑아 채점으로 고른다"는
-# 구조가 무너진다. 접근이 필요하면 채점 쪽에서 풀어야 한다.
-#
-# 제거 시점의 실측(seed 5555, 30 에피소드): 목적 지향을 켜면 적과의 거리가 71->63m로
-# 좁혀지고 끄면 68->85m로 벌어졌다(규칙 정책 75->54m). 즉 이 제거는 접근 성능을
-# 내주고 구조를 지키는 선택이며, 그 손실은 채점에서 회복해야 한다.
+# MOVE 목적지는 목표 방향을 손으로 주입하지 않는다. 첫 CEM iteration은 현재 위치 중심의
+# 넓은 Gaussian으로 reachable free-space를 넓게 탐색하고, 이후 iteration부터는 evaluator
+# 점수가 높은 elite의 step별 MOVE 목적지로 move_mean/std를 갱신한다. 다음 후보는 1틱
+# 이동 예산 안의 자유공간 중 갱신된 Gaussian likelihood가 높은 점을 더 자주 뽑는다.
+# 따라서 목적지 접근은 proposal prior가 아니라 score -> elite -> MOVE distribution
+# 경로로만 유도된다.
 # ENGAGE 표적을 그 스텝의 예측 상태로 다시 뽑는다. 끄면 이전 동작(전 스텝 균등 추출).
 #
 # 계획을 현재 상태만 보고 6스텝 한 번에 뽑으면, step k의 표적을 step k에 실제로 쏠 수
@@ -469,45 +466,134 @@ def _sample_structured_action_types(
     return result
 
 
+def _polyline_length(points: list[tuple[float, float]]) -> float:
+    """경로 점열의 월드 좌표 길이를 계산한다."""
+    if len(points) < 2:
+        return 0.0
+    return float(
+        sum(
+            math.hypot(b[0] - a[0], b[1] - a[1])
+            for a, b in zip(points, points[1:])
+        )
+    )
+
+
+def _astar_reachable_mask(
+    *,
+    anchors: torch.Tensor,
+    budgets: torch.Tensor,
+    free_tensor: torch.Tensor,
+    obstacles: list[tuple[float, float, float, float]],
+    euclidean_within: torch.Tensor,
+) -> torch.Tensor:
+    """유클리드 후보를 실제 A* 경로 길이로 다시 걸러낸다."""
+    _expect_rank("anchors", anchors, 2)
+    _expect_rank("budgets", budgets, 1)
+    _expect_rank("free_tensor", free_tensor, 2)
+    _expect_rank("euclidean_within", euclidean_within, 2)
+    if anchors.shape[0] != budgets.shape[0]:
+        raise ValueError("anchors와 budgets의 batch 크기가 같아야 한다")
+    if euclidean_within.shape != (anchors.shape[0], free_tensor.shape[0]):
+        raise ValueError("euclidean_within shape가 anchors/free_tensor와 맞지 않는다")
+
+    anchors_np = anchors.detach().cpu().numpy()
+    budgets_np = budgets.detach().cpu().numpy()
+    free_np = free_tensor.detach().cpu().numpy()
+    euclidean_np = euclidean_within.detach().cpu().numpy()
+    reachable_np = np.zeros_like(euclidean_np, dtype=np.bool_)
+    row_cache: dict[tuple[float, float, float], np.ndarray] = {}
+
+    for row_index, budget in enumerate(budgets_np):
+        budget_value = float(budget)
+        if budget_value <= 0.0:
+            continue
+        start = (float(anchors_np[row_index, 0]), float(anchors_np[row_index, 1]))
+        cache_key = (round(start[0], 3), round(start[1], 3), round(budget_value, 3))
+        cached = row_cache.get(cache_key)
+        if cached is not None:
+            reachable_np[row_index] = cached
+            continue
+        row_reachable = np.zeros(free_np.shape[0], dtype=np.bool_)
+        for point_index in np.flatnonzero(euclidean_np[row_index]):
+            goal = (float(free_np[point_index, 0]), float(free_np[point_index, 1]))
+            path = astar_path(start, goal, obstacles)
+            if path is not None and _polyline_length(path) <= budget_value + 1e-6:
+                row_reachable[point_index] = True
+        row_cache[cache_key] = row_reachable
+        reachable_np[row_index] = row_reachable
+
+    return torch.as_tensor(reachable_np, dtype=torch.bool, device=anchors.device)
+
+
 def _sample_free_within(
     anchor: torch.Tensor,
     budget: torch.Tensor,
     free_tensor: torch.Tensor,
+    obstacles: list[tuple[float, float, float, float]],
+    move_mean: torch.Tensor,
+    move_std: torch.Tensor,
     generator: torch.Generator,
-    *,
-    mean: torch.Tensor,
-    std: torch.Tensor,
 ) -> torch.Tensor:
-    """anchor에서 budget 안 자유공간 점을 CEM 목적지 분포로 가중해 뽑는다.
+    """A*로 도달 가능한 자유공간 중 CEM MOVE Gaussian에 따라 목적지를 샘플링한다.
 
-    자유공간 점을 뽑은 뒤 거리로 자르면 안 된다 — 잘린 지점이 건물 안에 떨어진다.
-    예산 안에 드는 점만 남기고 그중에서 고른다.
-
-    가중은 `update_distribution`이 엘리트 목적지로 갱신한 `move_mean`/`move_std`의
-    가우시안이다. 이걸 안 쓰고 균등 추출만 하면 **CEM 반복이 이동을 학습하지 못한다**
-    — 액션 종류와 표적은 반복마다 좁혀지는데 목적지만 매번 처음부터 무작위가 되고,
-    실측에서 목표에 가까워진 걸음이 33.4%로 무작위(50%)보다도 낮았다.
-
-    목적(목표 지점/최근접 적)을 손으로 지정하는 것과는 다르다. 그쪽은 사람이 넣은
-    전술 판단이라 제거했고, 이건 CEM이 스스로 높게 채점한 쪽으로 좁히는 본래 동작이다.
+    유클리드 거리로 불가능한 점을 먼저 버린 뒤, 남은 후보만 `terrain.astar_path`의
+    실제 경로 길이로 검증한다. free-space 점은 [-1, 1] 정규좌표로 바꿔
+    move_mean/std와 같은 좌표계에서 Gaussian likelihood를 계산한다.
     """
     flat_anchor = anchor.reshape(-1, 2)
-    distance = torch.cdist(flat_anchor.unsqueeze(0), free_tensor.unsqueeze(0)).squeeze(0)
-    within = distance <= budget.reshape(-1, 1)
-    # 예산 안에 하나도 없으면 가장 가까운 점을 허용해 항상 뽑을 수 있게 한다.
-    nearest = distance.argmin(dim=1, keepdim=True)
-    within.scatter_(1, nearest, True)
+    flat_budget = budget.reshape(-1)
 
-    # 축마다 std가 다르므로 축별로 표준화한 제곱거리를 쓴다.
-    delta = free_tensor.unsqueeze(0) - mean.reshape(-1, 1, 2)
-    scaled = delta / std.reshape(-1, 1, 2).clamp_min(1e-3)
-    logits = -0.5 * (scaled * scaled).sum(dim=-1)
-    logits = logits.masked_fill(~within, -float("inf"))
-    # 예산 안 점들이 전부 평균에서 멀면 logits가 모두 -inf에 가까워 softmax가 NaN이
-    # 될 수 있다. 행마다 최대값을 빼서 수치적으로 안정화한다.
-    logits = logits - logits.max(dim=1, keepdim=True).values
-    picked = torch.multinomial(torch.softmax(logits, dim=1), 1, generator=generator).squeeze(1)
-    return free_tensor.index_select(0, picked).reshape(anchor.shape)
+    # 실제 경로 길이는 유클리드 거리보다 짧을 수 없으므로 먼저 싸게 후보를 줄인다.
+    distance = torch.cdist(flat_anchor, free_tensor)  # (N, M), 유클리드 하한
+    euclidean_within = distance <= flat_budget.unsqueeze(1)
+    within = _astar_reachable_mask(
+        anchors=flat_anchor,
+        budgets=flat_budget,
+        free_tensor=free_tensor,
+        obstacles=obstacles,
+        euclidean_within=euclidean_within,
+    )
+
+    # 격자 해상도/경로 제약 때문에 budget 안에 점이 하나도 없을 수 있다. 이 경우에는
+    # softmax가 깨지지 않게 임시로 가장 가까운 점을 열어 두고, 최종 반환은 현재 위치로
+    # 되돌린다. 그래야 MOVE step이 도달 불가능한 목적지를 학습하지 않는다.
+    has_reachable = within.any(dim=1)
+    missing_rows = torch.nonzero(~has_reachable, as_tuple=False).flatten()
+    if missing_rows.numel() > 0:
+        nearest = distance.argmin(dim=1)
+        within[missing_rows, nearest.index_select(0, missing_rows)] = True
+
+    # free-space 점을 CEM MOVE 분포와 같은 [-1, 1] 정규좌표로 변환한다.
+    free_norm_x = (
+        (free_tensor[:, 0] - WORLD_X_MIN)
+        / (WORLD_X_MAX - WORLD_X_MIN)
+        * 2.0
+        - 1.0
+    )
+    free_norm_y = (
+        (free_tensor[:, 1] - WORLD_Y_MIN)
+        / (WORLD_Y_MAX - WORLD_Y_MIN)
+        * 2.0
+        - 1.0
+    )
+    free_norm = torch.stack([free_norm_x, free_norm_y], dim=-1)  # (M, 2)
+
+    mean = move_mean.reshape(-1, 2)
+    std = move_std.reshape(-1, 2).clamp_min(1e-6)
+    if mean.shape[0] != flat_anchor.shape[0] or std.shape[0] != flat_anchor.shape[0]:
+        raise ValueError("move_mean/std의 batch 크기는 anchor와 같아야 한다")
+
+    # 각 free-space 점의 diagonal Gaussian log-likelihood.
+    delta = (free_norm.unsqueeze(0) - mean.unsqueeze(1)) / std.unsqueeze(1)
+    logits = -0.5 * torch.square(delta).sum(dim=-1)
+    logits = logits.masked_fill(~within, float("-inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    picked = torch.multinomial(probs, 1, generator=generator).squeeze(1)
+    picked_points = free_tensor.index_select(0, picked)
+    if missing_rows.numel() > 0:
+        picked_points[missing_rows] = flat_anchor.index_select(0, missing_rows)
+    return picked_points.reshape(anchor.shape)
 
 
 def _sample_reachable_move_targets(
@@ -520,30 +606,23 @@ def _sample_reachable_move_targets(
     generator: torch.Generator,
     device: torch.device,
 ) -> torch.Tensor | None:
-    """MOVE 목적지를 연속 MOVE 구간마다 하나씩, 그 시점 위치 기준으로 뽑는다.
+    """MOVE 목적지를 step별 1틱 이동 가능 거리 안에서 CEM 분포로 뽑는다.
 
-    기존 prior는 목표까지 직선 보간에 가우시안을 얹어, 목적지의 37%가 건물 안이고
-    43%만 도달 가능했다. 절반 넘는 후보가 next_waypoint에서 STOP으로 떨어져 낭비되고,
-    모든 후보가 같은 방향(목표)으로 향해 다양성도 안 나온다.
+    - 연속 MOVE여도 합치지 않고 각 step이 자기 목적지를 직접 가진다.
+    - 각 MOVE step은 `MAX_MOVE_PER_STEP` 예산 안의 reachable free-space에서 뽑는다.
+    - 그 reachable 점들 중 `distribution.move_mean/std[step, unit]`의
+      Gaussian likelihood가 높은 점을 더 자주 뽑는다.
+    - 다음 step의 anchor는 직전 MOVE 목적지다. 비-MOVE step은 위치를 그대로 둔다.
 
-    **기준점은 그 시점의 위치여야 한다.** 6개 목적지를 전부 계획 시작 위치 기준으로
-    뽑으면, 세 번째 MOVE의 목적지를 "시작 위치에서 4.5유닛" 안에서 고르게 되는데
-    그때 유닛은 이미 다른 곳에 있다. 기준점이 틀린 샘플이다.
-
-    **연속 MOVE 구간은 목적지 하나를 공유한다.** MOVE,MOVE,MOVE면 그 시점 위치에서
-    4.5유닛 안의 한 점을 골라 세 스텝 동안 그리로 간다. 스텝마다 다른 점을 뽑으면
-    유닛이 갈지자로 흔들려 "우회 기동" 같은 안이 나오지 않는다.
-
-    ENGAGE나 STOP이 끼면 그 스텝에는 이동하지 않으므로 예산이 늘지 않는다. 구간이
-    끊기고 다음 MOVE 구간은 도착 지점에서 새로 시작한다.
-
-    반환 None은 자유공간 정보를 못 얻은 경우이고, 호출부가 기존 방식으로 되돌린다.
+    반환 None은 자유공간 정보를 얻지 못한 경우이며 호출부가 기존 Gaussian sample을
+    fallback으로 사용한다.
     """
+    obstacles = _obstacles_from_batch(current_batch)
     free = _free_points(current_batch)
     if free.shape[0] == 0:
         return None
 
-    features = torch.as_tensor(current_batch.features, device=device).float()
+    features = _batch_tensor(current_batch, "features", device=device).float()
     normalized = features.index_select(0, blue_indices)[:, [UNIT_X_INDEX, UNIT_Y_INDEX]]
     start = torch.stack(
         [
@@ -552,66 +631,65 @@ def _sample_reachable_move_targets(
         ],
         dim=-1,
     )
+
     candidates, horizon, num_units = action_type_ids.shape
-    free_tensor = torch.as_tensor(free, device=device)
+    if distribution.move_mean.shape != (horizon, num_units, 2):
+        raise ValueError("distribution.move_mean shape가 action plan의 (H, U, 2)와 맞지 않는다")
+    if distribution.move_std.shape != (horizon, num_units, 2):
+        raise ValueError("distribution.move_std shape가 action plan의 (H, U, 2)와 맞지 않는다")
 
-    # CEM 목적지 분포를 월드 좌표로 옮긴다. 정규좌표 [-1,1]이 월드 폭에 대응하므로
-    # std도 같은 배율로 늘린다.
-    span = torch.tensor(
-        [0.5 * (WORLD_X_MAX - WORLD_X_MIN), 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN)],
-        dtype=torch.float32,
-        device=device,
-    )
-    origin = torch.tensor(
-        [
-            0.5 * (WORLD_X_MAX + WORLD_X_MIN),
-            0.5 * (WORLD_Y_MAX + WORLD_Y_MIN),
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
-    move_mean_world = distribution.move_mean.to(device=device) * span + origin   # (H, U, 2)
-    move_std_world = distribution.move_std.to(device=device) * span             # (H, U, 2)
-
+    free_tensor = torch.as_tensor(free, dtype=torch.float32, device=device)
     is_move = (action_type_ids == int(ActionType.MOVE)) & issued_mask
-
-    # 각 스텝에서 시작하는 연속 MOVE 구간의 길이. 뒤에서부터 누적한다.
-    run_length = torch.zeros_like(is_move, dtype=torch.float32)
-    for step in range(horizon - 1, -1, -1):
-        following = run_length[:, step + 1] if step + 1 < horizon else 0.0
-        run_length[:, step] = torch.where(
-            is_move[:, step], 1.0 + following, torch.zeros_like(run_length[:, step])
-        )
-    previous_move = torch.cat(
-        [torch.zeros_like(is_move[:, :1]), is_move[:, :-1]], dim=1
-    )
-    run_start = is_move & ~previous_move
 
     anchor = start.reshape(1, num_units, 2).expand(candidates, num_units, 2).contiguous()
     current_target = anchor.clone()
-    targets = torch.zeros((candidates, horizon, num_units, 2), dtype=torch.float32, device=device)
+    targets = torch.zeros(
+        (candidates, horizon, num_units, 2),
+        dtype=torch.float32,
+        device=device,
+    )
 
     for step in range(horizon):
-        budget = run_length[:, step] * MAX_MOVE_PER_STEP
+        budget = is_move[:, step].float() * float(MAX_MOVE_PER_STEP)
+
+        step_move_mean = (
+            distribution.move_mean[step]
+            .unsqueeze(0)
+            .expand(candidates, num_units, 2)
+        )
+        step_move_std = (
+            distribution.move_std[step]
+            .unsqueeze(0)
+            .expand(candidates, num_units, 2)
+        )
+
         sampled = _sample_free_within(
             anchor,
             budget,
             free_tensor,
+            obstacles,
+            step_move_mean,
+            step_move_std,
             generator,
-            # 분포는 (H, U, 2)이고 anchor는 (후보, U, 2)라 후보 축으로 펼친다.
-            mean=move_mean_world[step].unsqueeze(0).expand(candidates, num_units, 2),
-            std=move_std_world[step].unsqueeze(0).expand(candidates, num_units, 2),
         )
-        begin = run_start[:, step].unsqueeze(-1)
-        current_target = torch.where(begin, sampled, current_target)
-        targets[:, step] = current_target
-        # 구간의 마지막 스텝이면 도착 지점이 다음 구간의 기준점이 된다.
-        next_move = is_move[:, step + 1] if step + 1 < horizon else torch.zeros_like(is_move[:, step])
-        finished = (is_move[:, step] & ~next_move).unsqueeze(-1)
-        anchor = torch.where(finished, current_target, anchor)
 
-    norm_x = (targets[..., 0] - WORLD_X_MIN) / (WORLD_X_MAX - WORLD_X_MIN) * 2.0 - 1.0
-    norm_y = (targets[..., 1] - WORLD_Y_MIN) / (WORLD_Y_MAX - WORLD_Y_MIN) * 2.0 - 1.0
+        move_now = is_move[:, step].unsqueeze(-1)
+        current_target = torch.where(move_now, sampled, anchor)
+        targets[:, step] = current_target
+        anchor = current_target
+
+    norm_x = (
+        (targets[..., 0] - WORLD_X_MIN)
+        / (WORLD_X_MAX - WORLD_X_MIN)
+        * 2.0
+        - 1.0
+    )
+    norm_y = (
+        (targets[..., 1] - WORLD_Y_MIN)
+        / (WORLD_Y_MAX - WORLD_Y_MIN)
+        * 2.0
+        - 1.0
+    )
     return _clip_move_xy(torch.stack([norm_x, norm_y], dim=-1))
 
 
@@ -687,8 +765,8 @@ def build_initial_distribution(current_batch: SlotBatch, config: CEMConfig, *, d
     action_probs = prior.reshape(1, 1, ACTION_TYPE_COUNT).expand(horizon, num_blue, ACTION_TYPE_COUNT).clone()
 
     # 초기 목적지 분포는 현재 위치 중심에 initial_move_std로 넓게 둔다. 이 std는
-    # 정규좌표 0.45(월드 9유닛)이고 6스텝 이동 예산도 9유닛이라, 첫 iteration은
-    # 예산 안 자유공간에서 사실상 균등 추출이 된다. 이후 iteration부터 엘리트가 좁힌다.
+    # 정규좌표 0.45(월드 9유닛)라 1틱 이동 예산 안에서는 비교적 넓게 탐색한다.
+    # 이후 iteration부터 엘리트가 좁힌다.
     #
     # 전에는 목표 지점까지 직선 보간을 초기 평균으로 썼다. move_mean이 실제로
     # 샘플링에 쓰이게 된 지금 그대로 두면 "목표로 가라"는 전술 판단을 제안 분포에
@@ -743,23 +821,56 @@ def sample_future_action_plans(
         raise ValueError("distribution unit 수와 current_batch BLUE unit 수가 같아야 한다")
 
     candidates = config.num_candidates
-    action_features = torch.zeros((candidates, horizon, num_units, ACTION_DIM), dtype=torch.float32, device=device)
-    action_unit_ids = unit_ids.reshape(1, 1, num_units).expand(candidates, horizon, num_units).clone()
-    issued_mask = issued_unit_mask.reshape(1, 1, num_units).expand(candidates, horizon, num_units).clone()
-    action_type_ids = torch.full((candidates, horizon, num_units), NO_COMMAND_TYPE_ID, dtype=torch.long, device=device)
-    target_entity_ids = torch.full((candidates, horizon, num_units), NO_TARGET_ENTITY_ID, dtype=torch.long, device=device)
+    action_features = torch.zeros(
+        (candidates, horizon, num_units, ACTION_DIM),
+        dtype=torch.float32,
+        device=device,
+    )
+    action_unit_ids = (
+        unit_ids.reshape(1, 1, num_units)
+        .expand(candidates, horizon, num_units)
+        .clone()
+    )
+    issued_mask = (
+        issued_unit_mask.reshape(1, 1, num_units)
+        .expand(candidates, horizon, num_units)
+        .clone()
+    )
+    action_type_ids = torch.full(
+        (candidates, horizon, num_units),
+        NO_COMMAND_TYPE_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    target_entity_ids = torch.full(
+        (candidates, horizon, num_units),
+        NO_TARGET_ENTITY_ID,
+        dtype=torch.long,
+        device=device,
+    )
 
+    # 자유공간 정보를 얻지 못했을 때 사용할 fallback MOVE sample. 정상 경로에서는 아래
+    # _sample_reachable_move_targets가 같은 CEM distribution을 반영한 reachable target으로
+    # 교체한다.
     move_xy_norm = _clip_move_xy(
         torch.normal(
-            mean=distribution.move_mean.reshape(1, horizon, num_units, 2).expand(candidates, horizon, num_units, 2),
-            std=distribution.move_std.reshape(1, horizon, num_units, 2).expand(candidates, horizon, num_units, 2),
+            mean=distribution.move_mean.reshape(1, horizon, num_units, 2).expand(
+                candidates, horizon, num_units, 2
+            ),
+            std=distribution.move_std.reshape(1, horizon, num_units, 2).expand(
+                candidates, horizon, num_units, 2
+            ),
             generator=generator,
         )
     )
     theta_radians = _wrap_radians(
         torch.normal(
-            mean=distribution.turn_mean.reshape(1, horizon, num_units).expand(candidates, horizon, num_units),
-            std=distribution.turn_std.reshape(1, horizon, num_units).expand(candidates, horizon, num_units),
+            mean=distribution.turn_mean.reshape(1, horizon, num_units).expand(
+                candidates, horizon, num_units
+            ),
+            std=distribution.turn_std.reshape(1, horizon, num_units).expand(
+                candidates, horizon, num_units
+            ),
             generator=generator,
         )
     )
@@ -770,12 +881,20 @@ def sample_future_action_plans(
         generator=generator,
         device=device,
     )
-    flat_target_probs = distribution.target_probs.reshape(horizon * num_units, distribution.target_probs.shape[-1])
-    sampled_targets = _sample_categorical(flat_target_probs, sample_count=candidates, generator=generator)
+
+    flat_target_probs = distribution.target_probs.reshape(
+        horizon * num_units,
+        distribution.target_probs.shape[-1],
+    )
+    sampled_targets = _sample_categorical(
+        flat_target_probs,
+        sample_count=candidates,
+        generator=generator,
+    )
     target_indices = sampled_targets.reshape(candidates, horizon, num_units)
 
-    # MOVE 목적지를 도달 가능한 자유공간에서 다시 뽑는다. action_type_ids가 정해진
-    # 뒤라야 유닛별 이동 예산(누적 MOVE 횟수)을 알 수 있어 여기에 둔다.
+    # action type이 정해진 뒤 MOVE step만 1틱 이동 예산 안에서 reachable free-space를
+    # 구하고, distribution.move_mean/std의 Gaussian으로 가중 샘플링한다.
     reachable = _sample_reachable_move_targets(
         current_batch=current_batch,
         distribution=distribution,
@@ -789,14 +908,19 @@ def sample_future_action_plans(
         move_xy_norm = reachable
 
     action_features[..., 0] = action_type_ids.float()
+
     move_mask = issued_mask & (action_type_ids == int(ActionType.MOVE))
     action_features[..., 1][move_mask] = 1.0
     action_features[..., MOVE_X_INDEX][move_mask] = move_xy_norm[..., 0][move_mask]
     action_features[..., MOVE_Y_INDEX][move_mask] = move_xy_norm[..., 1][move_mask]
 
     engage_mask = issued_mask & (action_type_ids == int(ActionType.ENGAGE))
-    selected_red_xy = red_xy.index_select(0, target_indices.reshape(-1)).reshape(candidates, horizon, num_units, 2)
-    selected_red_ids = red_ids.index_select(0, target_indices.reshape(-1)).reshape(candidates, horizon, num_units)
+    selected_red_xy = red_xy.index_select(0, target_indices.reshape(-1)).reshape(
+        candidates, horizon, num_units, 2
+    )
+    selected_red_ids = red_ids.index_select(0, target_indices.reshape(-1)).reshape(
+        candidates, horizon, num_units
+    )
     action_features[..., 4][engage_mask] = 1.0
     action_features[..., TARGET_TEAM_INDEX][engage_mask] = float(TeamId.RED)
     action_features[..., TARGET_X_INDEX][engage_mask] = selected_red_xy[..., 0][engage_mask]
@@ -811,6 +935,7 @@ def sample_future_action_plans(
     action_features[~issued_mask] = 0.0
     action_type_ids[~issued_mask] = NO_COMMAND_TYPE_ID
     target_entity_ids[~issued_mask] = NO_TARGET_ENTITY_ID
+
     return FutureActionPlanBatch(
         action_features=action_features,
         action_unit_ids=action_unit_ids,
@@ -942,11 +1067,24 @@ def update_distribution(
     elite_indices: torch.Tensor,
     config: CEMConfig,
 ) -> CEMDistribution:
-    """elite 후보로 CEM 분포를 갱신한다."""
+    """elite 후보로 CEM 분포를 갱신한다.
+
+    action type은 명령이 발행된 모든 elite로 갱신하고, action별 파라미터는 그 action이
+    실제로 선택된 elite만 사용한다.
+
+    - MOVE   -> move_mean / move_std
+    - ENGAGE -> target_probs
+    - TURN   -> turn_mean / turn_std
+
+    STOP이나 다른 action의 dummy parameter가 해당 분포 통계에 섞이지 않게 한다.
+    """
     _expect_rank("elite_indices", elite_indices, 1)
     if elite_indices.numel() != config.num_elites:
         raise ValueError("elite_indices 길이는 config.num_elites와 같아야 한다")
-    elite_indices = elite_indices.to(device=plans.action_features.device, dtype=torch.long)
+    elite_indices = elite_indices.to(
+        device=plans.action_features.device,
+        dtype=torch.long,
+    )
 
     elite_actions = plans.action_type_ids.index_select(0, elite_indices)
     elite_targets = plans.target_indices.index_select(0, elite_indices)
@@ -956,60 +1094,140 @@ def update_distribution(
 
     action_probs = distribution.action_probs.clone()
     target_probs = distribution.target_probs.clone()
+    move_mean = distribution.move_mean.clone()
+    move_std = distribution.move_std.clone()
+    turn_mean = distribution.turn_mean.clone()
+    turn_std = distribution.turn_std.clone()
+
     horizon, num_units, _ = action_probs.shape
+    num_targets = distribution.target_probs.shape[-1]
+
     for step_index in range(horizon):
         for unit_index in range(num_units):
-            valid = elite_issued[:, step_index, unit_index]
-            if torch.any(valid):
-                counts = torch.bincount(
-                    elite_actions[valid, step_index, unit_index],
-                    minlength=ACTION_TYPE_COUNT,
-                ).float()
-                empirical_action = _normalized_probability(counts)
-                empirical_action = torch.clamp(empirical_action, min=config.min_action_probability)
-                empirical_action = _normalized_probability(empirical_action)
-                action_probs[step_index, unit_index] = (
-                    config.smoothing * distribution.action_probs[step_index, unit_index]
-                    + (1.0 - config.smoothing) * empirical_action
-                )
-                action_probs[step_index, unit_index] = _normalized_probability(action_probs[step_index, unit_index])
+            issued_valid = elite_issued[:, step_index, unit_index]
+            if not bool(issued_valid.any()):
+                continue
 
+            # 1) Action categorical distribution: 발행된 모든 elite action을 사용한다.
+            counts = torch.bincount(
+                elite_actions[issued_valid, step_index, unit_index],
+                minlength=ACTION_TYPE_COUNT,
+            ).float()
+            empirical_action = _normalized_probability(counts)
+            empirical_action = torch.clamp(
+                empirical_action,
+                min=config.min_action_probability,
+            )
+            empirical_action = _normalized_probability(empirical_action)
+            action_probs[step_index, unit_index] = _normalized_probability(
+                config.smoothing * distribution.action_probs[step_index, unit_index]
+                + (1.0 - config.smoothing) * empirical_action
+            )
+
+            # 2) ENGAGE target: 실제 ENGAGE였던 elite만 사용한다.
+            engage_valid = issued_valid & (
+                elite_actions[:, step_index, unit_index] == int(ActionType.ENGAGE)
+            )
+            if bool(engage_valid.any()):
                 target_counts = torch.bincount(
-                    elite_targets[:, step_index, unit_index],
-                    minlength=distribution.target_probs.shape[-1],
+                    elite_targets[engage_valid, step_index, unit_index],
+                    minlength=num_targets,
                 ).float()
                 empirical_target = _normalized_probability(target_counts)
-                target_probs[step_index, unit_index] = (
+                target_probs[step_index, unit_index] = _normalized_probability(
                     config.smoothing * distribution.target_probs[step_index, unit_index]
                     + (1.0 - config.smoothing) * empirical_target
                 )
-                target_probs[step_index, unit_index] = _normalized_probability(target_probs[step_index, unit_index])
 
-    move_mean_emp = elite_moves.mean(dim=0)
-    move_std_emp = torch.clamp(elite_moves.std(dim=0, unbiased=False), min=config.min_move_std)
-    move_mean = _clip_move_xy(config.smoothing * distribution.move_mean + (1.0 - config.smoothing) * move_mean_emp)
-    move_std = torch.clamp(
-        config.smoothing * distribution.move_std + (1.0 - config.smoothing) * move_std_emp,
-        min=config.min_move_std,
-    ).float()
+            # 3) MOVE destination: 실제 MOVE였던 elite만 사용한다.
+            move_valid = issued_valid & (
+                elite_actions[:, step_index, unit_index] == int(ActionType.MOVE)
+            )
+            num_move = int(move_valid.sum().item())
+            if num_move > 0:
+                move_samples = elite_moves[
+                    move_valid,
+                    step_index,
+                    unit_index,
+                ]
+                empirical_mean = move_samples.mean(dim=0)
+                move_mean[step_index, unit_index] = _clip_move_xy(
+                    config.smoothing * distribution.move_mean[step_index, unit_index]
+                    + (1.0 - config.smoothing) * empirical_mean
+                )
 
-    theta_vector = torch.polar(torch.ones_like(elite_theta), elite_theta)
-    theta_mean_emp = torch.angle(theta_vector.mean(dim=0)).float()
-    resultant = torch.abs(theta_vector.mean(dim=0)).float()
-    theta_std_emp = torch.sqrt(torch.clamp(-2.0 * torch.log(torch.clamp(resultant, min=1e-6, max=1.0)), min=0.0))
-    theta_std_emp = torch.clamp(theta_std_emp, min=config.min_turn_std)
-    turn_mean = _wrap_radians(config.smoothing * distribution.turn_mean + (1.0 - config.smoothing) * theta_mean_emp)
-    turn_std = torch.clamp(
-        config.smoothing * distribution.turn_std + (1.0 - config.smoothing) * theta_std_emp,
-        min=config.min_turn_std,
-    ).float()
+                # 한 점으로 std를 추정하면 0으로 붕괴하므로 2개 이상일 때만 갱신한다.
+                if num_move >= 2:
+                    empirical_std = torch.clamp(
+                        move_samples.std(dim=0, unbiased=False),
+                        min=config.min_move_std,
+                    )
+                    move_std[step_index, unit_index] = torch.clamp(
+                        config.smoothing * distribution.move_std[step_index, unit_index]
+                        + (1.0 - config.smoothing) * empirical_std,
+                        min=config.min_move_std,
+                    )
+
+            # 4) TURN angle: 실제 TURN이었던 elite만 사용한다.
+            turn_valid = issued_valid & (
+                elite_actions[:, step_index, unit_index] == int(ActionType.TURN)
+            )
+            num_turn = int(turn_valid.sum().item())
+            if num_turn > 0:
+                theta_samples = elite_theta[
+                    turn_valid,
+                    step_index,
+                    unit_index,
+                ]
+                theta_vector = torch.polar(
+                    torch.ones_like(theta_samples),
+                    theta_samples,
+                )
+                empirical_turn_mean = torch.angle(theta_vector.mean()).float()
+
+                # 평균 방향은 원형 공간에서 smoothing한다. ±pi 경계에서 선형 평균이
+                # 반대 방향으로 튀는 것을 막는다.
+                old_vector = torch.polar(
+                    torch.ones((), dtype=torch.float32, device=theta_samples.device),
+                    distribution.turn_mean[step_index, unit_index],
+                )
+                empirical_vector = torch.polar(
+                    torch.ones((), dtype=torch.float32, device=theta_samples.device),
+                    empirical_turn_mean,
+                )
+                blended_vector = (
+                    config.smoothing * old_vector
+                    + (1.0 - config.smoothing) * empirical_vector
+                )
+                turn_mean[step_index, unit_index] = torch.angle(blended_vector).float()
+
+                if num_turn >= 2:
+                    resultant = torch.abs(theta_vector.mean()).float()
+                    empirical_turn_std = torch.sqrt(
+                        torch.clamp(
+                            -2.0
+                            * torch.log(
+                                torch.clamp(resultant, min=1e-6, max=1.0)
+                            ),
+                            min=0.0,
+                        )
+                    )
+                    empirical_turn_std = torch.clamp(
+                        empirical_turn_std,
+                        min=config.min_turn_std,
+                    )
+                    turn_std[step_index, unit_index] = torch.clamp(
+                        config.smoothing * distribution.turn_std[step_index, unit_index]
+                        + (1.0 - config.smoothing) * empirical_turn_std,
+                        min=config.min_turn_std,
+                    )
 
     return CEMDistribution(
         action_probs=action_probs.float(),
-        move_mean=move_mean,
-        move_std=move_std,
-        turn_mean=turn_mean,
-        turn_std=turn_std,
+        move_mean=move_mean.float(),
+        move_std=move_std.float(),
+        turn_mean=_wrap_radians(turn_mean),
+        turn_std=turn_std.float(),
         target_probs=target_probs.float(),
     )
 
