@@ -9,7 +9,6 @@ projection만 거치고 객체 간 상호작용은 action-conditioned predictor�
 from __future__ import annotations
 
 import copy
-import os
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -27,21 +26,6 @@ from hackerthon.worldmodel.slots import (
     ObjectType,
     TeamId,
 )
-
-
-# 지형·임무 slot을 predictor query에서 빼고 key/value로만 둔다.
-#
-# predictor는 시간축과 객체축을 펼쳐 6층 full self-attention을 돈다. slot의 89%가
-# 지형이라(강남역 장애물 142 대 유닛 16) attention 비용의 대부분이 정지한 건물을
-# 예측하는 데 쓰인다. query에서 빼면 L_query x L_key가 되어 10~20배 줄어든다.
-#
-# 한 층이면 self-attention이 행마다 독립이라 그냥 빼도 결과가 같지만, 6층이면 다음
-# 층의 지형 key가 이 층의 지형 출력이라 그럴 수 없다. 그래서 지형 token을 입력
-# 임베딩 상태로 고정해 모든 층이 같은 것을 참조하게 한다 — 정지 객체라 층을 거치며
-# 정제할 내용이 없다는 가정이고, 예측 오차로 확인해야 한다.
-#
-# 0으로 두면 이전 경로(전체 slot이 query)라 같은 코드로 A/B를 돌릴 수 있다.
-STATIC_TERRAIN_KV = os.environ.get("CJEPA_STATIC_TERRAIN_KV", "1") not in ("0", "false", "False")
 
 
 TEAM_EMBEDDING_INDEX: Mapping[int, int] = {
@@ -453,38 +437,18 @@ class FullSelfAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        *,
-        attn_mask: torch.Tensor,
-        static_context: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """시간축과 객체축을 펼친 token sequence에 causal attention을 적용한다.
-
-        `static_context`를 주면 그 token들을 **key/value로만** 쓴다. 지형·임무처럼
-        정지한 객체를 query에서 빼기 위한 것이다. self-attention은 행마다 독립이라
-        query를 빼도 남은 행의 출력이 변하지 않지만, 층이 여러 개면 다음 층의 지형
-        key가 이 층의 지형 출력이라 그냥 뺄 수 없다. 그래서 지형 token은 입력
-        임베딩 상태로 고정해 모든 층이 같은 것을 참조한다.
-        """
+    def forward(self, tokens: torch.Tensor, *, attn_mask: torch.Tensor) -> torch.Tensor:
+        """시간축과 객체축을 펼친 token sequence에 causal attention을 적용한다."""
         _expect_rank("tokens", tokens, 3)
         _expect_rank("attn_mask", attn_mask, 2)
         _expect_bool("attn_mask", attn_mask)
-        query_length = tokens.shape[1]
-        key_length = query_length if static_context is None else query_length + static_context.shape[1]
-        if attn_mask.shape != (query_length, key_length):
-            raise ValueError("attn_mask shape는 (L_query, L_key)이어야 한다")
+        if attn_mask.shape != (tokens.shape[1], tokens.shape[1]):
+            raise ValueError("attn_mask shape는 (L, L)이어야 한다")
         attn_input = self.attn_norm(tokens)
-        if static_context is None:
-            key_value = attn_input
-        else:
-            _expect_rank("static_context", static_context, 3)
-            key_value = torch.cat([attn_input, self.attn_norm(static_context)], dim=1)
         attn_out, _ = self.attn(
             attn_input,
-            key_value,
-            key_value,
+            attn_input,
+            attn_input,
             attn_mask=attn_mask,
             need_weights=False,
         )
@@ -506,20 +470,10 @@ class TemporalCausalObjectTransformer(nn.Module):
         )
         self.output_norm = nn.LayerNorm(embedding_dim)
 
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        *,
-        attn_mask: torch.Tensor,
-        static_context: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """mask token, 실제 history token, future query token을 causal하게 처리한다.
-
-        `static_context`는 층마다 갱신하지 않고 그대로 넘긴다 — 정지 객체라 층을
-        거치며 정제할 내용이 없다는 가정이다.
-        """
+    def forward(self, tokens: torch.Tensor, *, attn_mask: torch.Tensor) -> torch.Tensor:
+        """mask token, 실제 history token, future query token을 causal하게 처리한다."""
         for layer in self.layers:
-            tokens = layer(tokens, attn_mask=attn_mask, static_context=static_context)
+            tokens = layer(tokens, attn_mask=attn_mask)
         return self.output_norm(tokens)
 
 
@@ -563,95 +517,15 @@ class CausalMaskedObjectPredictor(nn.Module):
         total_frames: int,
         total_token_slots: int,
         device: torch.device,
-        query_slots: int | None = None,
-        static_slots: int = 0,
     ) -> torch.Tensor:
-        """query frame이 미래 frame token을 보지 못하게 하는 attention mask.
-
-        `query_slots`를 주면 query 축만 그 수로 줄이고 key 축은 `total_token_slots`
-        전체를 유지한다. 그 뒤에 정지 객체 `static_slots`개가 프레임마다 key로 붙는다.
-        반환 shape는 `(T*query_slots, T*total_token_slots + T*static_slots)`이다.
-        """
+        """query frame이 미래 frame token을 보지 못하게 하는 attention mask."""
         if total_frames <= 0:
             raise ValueError("total_frames는 0보다 커야 한다")
         if total_token_slots <= 0:
             raise ValueError("total_token_slots는 0보다 커야 한다")
-        if query_slots is None:
-            query_slots = total_token_slots
-        if query_slots <= 0:
-            raise ValueError("query_slots는 0보다 커야 한다")
-        if static_slots < 0:
-            raise ValueError("static_slots는 음수일 수 없다")
-        arange = torch.arange(total_frames, device=device)
-        query_frames = arange.repeat_interleave(query_slots)
-        key_frames = arange.repeat_interleave(total_token_slots)
-        if static_slots > 0:
-            key_frames = torch.cat([key_frames, arange.repeat_interleave(static_slots)])
+        frame_ids = torch.arange(total_frames, device=device).repeat_interleave(total_token_slots)
         # PyTorch MultiheadAttention의 bool attn_mask는 True가 차단을 뜻한다.
-        return key_frames.unsqueeze(0) > query_frames.unsqueeze(1)
-
-    def _run_transformer(
-        self,
-        model_input: torch.Tensor,
-        *,
-        type_ids: torch.Tensor | None,
-        num_object_slots: int,
-    ) -> torch.Tensor:
-        """predictor transformer를 돌린다. 정지 객체는 query에서 빼고 key/value로만 둔다.
-
-        `model_input`은 `(B, T, S_total, D)`이고 S_total = object slot + action token이다.
-        `type_ids`가 `(B, N_object)`로 주어지면 unit이 아닌 slot을 정지 객체로 보고
-        query에서 제외한다. 없으면 전체를 query로 두는 이전 동작이다.
-
-        attention 비용이 `L_query x L_key`이므로 slot의 대부분(실측 89%)인 지형을
-        query에서 빼면 10~20배 줄어든다. `STATIC_TERRAIN_KV=0`으로 끄면 이전 경로다.
-
-        정지 slot의 출력은 입력값을 그대로 통과시킨다. 손실이 unit slot만 보고
-        rollout이 지형·임무를 마지막 관측값으로 채우므로 쓰이지 않는다.
-        """
-        batch_size, total_frames, total_token_slots, embedding_dim = model_input.shape
-        static_index: torch.Tensor | None = None
-        if STATIC_TERRAIN_KV and type_ids is not None:
-            # 배치 안 slot layout이 같다는 것은 _validate_batch_layout이 보장한다.
-            is_unit = type_ids[0] == int(ObjectType.UNIT)
-            is_query = torch.ones(total_token_slots, dtype=torch.bool, device=model_input.device)
-            is_query[:num_object_slots] = is_unit
-            if not bool(is_query.all()):
-                static_index = torch.nonzero(~is_query, as_tuple=False).flatten()
-                query_index = torch.nonzero(is_query, as_tuple=False).flatten()
-
-        if static_index is None:
-            flat_input = model_input.reshape(batch_size, total_frames * total_token_slots, embedding_dim)
-            attn_mask = self.temporal_attention_mask(
-                total_frames=total_frames,
-                total_token_slots=total_token_slots,
-                device=flat_input.device,
-            )
-            flat_output = self.transformer(flat_input, attn_mask=attn_mask)
-            return flat_output.reshape(batch_size, total_frames, total_token_slots, embedding_dim)
-
-        num_query = int(query_index.numel())
-        num_static = int(static_index.numel())
-        query_input = model_input.index_select(2, query_index).reshape(
-            batch_size, total_frames * num_query, embedding_dim
-        )
-        static_input = model_input.index_select(2, static_index).reshape(
-            batch_size, total_frames * num_static, embedding_dim
-        )
-        attn_mask = self.temporal_attention_mask(
-            total_frames=total_frames,
-            total_token_slots=num_query,
-            device=model_input.device,
-            query_slots=num_query,
-            static_slots=num_static,
-        )
-        query_output = self.transformer(
-            query_input, attn_mask=attn_mask, static_context=static_input
-        ).reshape(batch_size, total_frames, num_query, embedding_dim)
-
-        output = model_input.clone()
-        output[:, :, query_index] = query_output
-        return output
+        return frame_ids.unsqueeze(0) > frame_ids.unsqueeze(1)
 
     def _validate_predictor_inputs(
         self,
@@ -819,10 +693,16 @@ class CausalMaskedObjectPredictor(nn.Module):
             team_ids=team_ids,
             action_tokens=action_tokens,
         )
+        batch_size, total_frames, total_token_slots, embedding_dim = model_input.shape
         num_object_slots = history_tokens.shape[2]
-        output = self._run_transformer(
-            model_input, type_ids=type_ids, num_object_slots=num_object_slots
+        flat_input = model_input.reshape(batch_size, total_frames * total_token_slots, embedding_dim)
+        attn_mask = self.temporal_attention_mask(
+            total_frames=total_frames,
+            total_token_slots=total_token_slots,
+            device=flat_input.device,
         )
+        flat_output = self.transformer(flat_input, attn_mask=attn_mask)
+        output = flat_output.reshape(batch_size, total_frames, total_token_slots, embedding_dim)
         output = self.output_projection(output)
         return output[:, :, :num_object_slots], masked_indices, masked_slot_mask
 
@@ -843,25 +723,22 @@ class CausalMaskedObjectPredictor(nn.Module):
             action_tokens=action_tokens,
             masked_indices=masked_indices,
         )
+        batch_size, total_frames, total_token_slots, embedding_dim = model_input.shape
         num_object_slots = history_tokens.shape[2]
-        output = self._run_transformer(
-            model_input, type_ids=type_ids, num_object_slots=num_object_slots
+        flat_input = model_input.reshape(batch_size, total_frames * total_token_slots, embedding_dim)
+        attn_mask = self.temporal_attention_mask(
+            total_frames=total_frames,
+            total_token_slots=total_token_slots,
+            device=flat_input.device,
         )
+        flat_output = self.transformer(flat_input, attn_mask=attn_mask)
+        output = flat_output.reshape(batch_size, total_frames, total_token_slots, embedding_dim)
         output = self.output_projection(output)
         return output[:, :, :num_object_slots], masked_indices, masked_slot_mask
 
     @torch.no_grad()
-    def inference(
-        self,
-        history_tokens: torch.Tensor,
-        *,
-        action_tokens: torch.Tensor,
-        type_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """planning 때 쓰는 비마스킹 future prediction 경로.
-
-        `type_ids`(B, N)를 주면 정지 객체를 query에서 빼 attention 비용을 줄인다.
-        """
+    def inference(self, history_tokens: torch.Tensor, *, action_tokens: torch.Tensor) -> torch.Tensor:
+        """planning 때 쓰는 비마스킹 future prediction 경로."""
         _expect_rank("history_tokens", history_tokens, 4)
         _expect_rank("action_tokens", action_tokens, 4)
         batch_size, history_frames, num_slots, embedding_dim = history_tokens.shape
@@ -908,9 +785,15 @@ class CausalMaskedObjectPredictor(nn.Module):
         )
         action_input = action_tokens + action_pos
         model_input = torch.cat([object_input, action_input], dim=2)
-        output = self._run_transformer(
-            model_input, type_ids=type_ids, num_object_slots=num_slots
+        total_token_slots = num_slots + num_action_tokens
+        flat_input = model_input.reshape(batch_size, self.total_frames * total_token_slots, embedding_dim)
+        attn_mask = self.temporal_attention_mask(
+            total_frames=self.total_frames,
+            total_token_slots=total_token_slots,
+            device=flat_input.device,
         )
+        flat_output = self.transformer(flat_input, attn_mask=attn_mask)
+        output = flat_output.reshape(batch_size, self.total_frames, total_token_slots, embedding_dim)
         output = self.output_projection(output)
         return output[:, history_frames:self.total_frames, :num_slots]
 
@@ -1667,7 +1550,6 @@ class DEVSObjectCentricWorldModel(nn.Module):
         future_tokens = self.masked_predictor.inference(
             history_tokens,
             action_tokens=action_tokens,
-            type_ids=history_type_ids[:, 0],
         )
         future_type_ids = full_type_ids[:, self.config.history_frames:total_frames]
         # 미래 프레임은 unit slot만 디코딩한다. 지형과 임무는 정지 물체라 미래가 이미

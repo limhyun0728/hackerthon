@@ -1,0 +1,1676 @@
+"""Torch 기반 CEM으로 DEVS joint action sequence를 탐색한다.
+
+CEM은 후보 action sequence를 샘플링하고, 월드모델 rollout 결과를 evaluator로
+점수화한 뒤 elite 후보로 분포를 갱신한다. 여기서는 DEVS action vocabulary
+`STOP`, `MOVE`, `ENGAGE`, `TURN`만 사용한다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import torch
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from hackerthon.combat_config import MAX_FIRE_RANGE
+from hackerthon.terrain import (
+    WORLD_X_MAX,
+    WORLD_X_MIN,
+    WORLD_Y_MAX,
+    WORLD_Y_MIN,
+    astar_path,
+    component_points,
+    largest_free_component,
+)
+from hackerthon.worldmodel.actions import ACTION_DIM, ActionType, NO_COMMAND_TYPE_ID, NO_TARGET_ENTITY_ID
+from hackerthon.worldmodel.evaluator import BLUE_MAX_STEP_PER_SEC, EvaluatorWeights
+from hackerthon.worldmodel.slots import (
+    ObjectType,
+    MAX_FEATURE_DIM,
+    MISSION_DESTROY_ALL,
+    MISSION_DESTROY_AND_REACH,
+    MISSION_REACH_OBJECTIVE,
+    MISSION_HOLD_OBJECTIVE,
+    OBJECTIVE_RADIUS,
+    SlotBatch,
+    TeamId,
+    build_slot_batch_from_v2_run,
+)
+
+
+MOVE_X_INDEX = 2
+MOVE_Y_INDEX = 3
+TARGET_TEAM_INDEX = 5
+TARGET_X_INDEX = 6
+TARGET_Y_INDEX = 7
+THETA_COS_INDEX = 9
+THETA_SIN_INDEX = 10
+UNIT_HP_INDEX = 1
+UNIT_AMMO_INDEX = 2
+UNIT_X_INDEX = 3
+UNIT_Y_INDEX = 4
+UNIT_ALIVE_INDEX = 7
+MISSION_TYPE_INDEX = 0
+MISSION_OBJECTIVE_X_INDEX = 1
+MISSION_OBJECTIVE_Y_INDEX = 2
+
+# 임무별 채점 배율. 같은 evaluator를 쓰되 무엇을 보상할지만 바꾼다.
+#   attack:    RED 격파 관련 항 (damage/kia/finish/hp_mass)
+#   progress:  objective 전진 항
+#   blue_loss: BLUE 피해 페널티
+MISSION_SCORE_SCALES: dict[int, tuple[float, float, float]] = {
+    MISSION_DESTROY_AND_REACH: (1.0, 1.0, 1.0),
+    # 도달 요구가 없으니 전진 보상을 낮추고 격파에 집중한다.
+    MISSION_DESTROY_ALL: (1.0, 0.25, 1.0),
+    # 침투 임무. 교전은 수단일 뿐이라 격파 보상을 줄이고 전진과 생존을 키운다.
+    MISSION_REACH_OBJECTIVE: (0.3, 3.0, 1.5),
+    # 거점 방어. objective로 붙는 전진 보상을 살려 두고(그래야 거점을 잡는다)
+    # BLUE 피해 페널티를 키워 무리한 돌격 대신 점유 유지를 고르게 한다.
+    MISSION_HOLD_OBJECTIVE: (0.6, 1.5, 2.5),
+}
+ACTION_TYPE_COUNT = len(ActionType)
+DEFAULT_ACTION_PRIOR = (0.20, 0.50, 0.25, 0.05)
+# 후보별 액션 성향을 뽑는 Dirichlet 농도. 방향은 전체 평균 비율, 크기는 후보 간 퍼짐을
+# 정한다 (작을수록 극단적인 후보가 많아진다). Sigma alpha = 1.0에서 교전태세 5칸이
+# 20/22/25/18/15로 거의 균등하게 찬다.
+CANDIDATE_MIX_ALPHA = (0.25, 0.45, 0.28, 0.02)
+# 직전 액션을 그대로 이어갈 확률 범위. 후보마다 뽑아 구간 길이를 다양하게 만든다.
+STICKINESS_RANGE = (0.3, 0.8)
+# MOVE 목적지는 목표 방향을 손으로 주입하지 않는다. 첫 CEM iteration은 현재 위치 중심의
+# 넓은 Gaussian으로 reachable free-space를 넓게 탐색하고, 이후 iteration부터는 evaluator
+# 점수가 높은 elite의 step별 MOVE 목적지로 move_mean/std를 갱신한다. 다음 후보는 1틱
+# 이동 예산 안의 자유공간 중 갱신된 Gaussian likelihood가 높은 점을 더 자주 뽑는다.
+# 따라서 목적지 접근은 proposal prior가 아니라 score -> elite -> MOVE distribution
+# 경로로만 유도된다.
+# ENGAGE 표적을 그 스텝의 예측 상태로 다시 뽑는다. 끄면 이전 동작(전 스텝 균등 추출).
+#
+# 계획을 현재 상태만 보고 6스텝 한 번에 뽑으면, step k의 표적을 step k에 실제로 쏠 수
+# 있는 적 중에서 고를 방법이 없다. 현재 상태를 아는 스텝은 step 0뿐이고 거기에만
+# hard mask가 걸린다. 그래서 실측에서 step 0은 ENGAGE 실행률 100%인데 step 5는 3.6%다.
+#
+# 차단된 ENGAGE 108건을 분해하면 59.3%는 접근 문제가 아니었다 — 가장 가까운 생존 적이
+# 중앙 35m(유효사거리 70m 안)인데 RED 9명 중 균등 추출로 빗나간 표적을 골랐다.
+# 차단 시점 유효 표적은 평균 1.29명뿐이라 1/9 추출로는 약 14%만 맞는다.
+RETARGET_ENGAGE = os.environ.get("CEM_RETARGET_ENGAGE", "1") not in ("0", "false", "False")
+# 월드모델 rollout을 몇 후보씩 끊어 굴릴지.
+#
+# 사용량은 후보 수 x slot 수^2로 커진다(attention). slot 수는 유닛 수와 지형 장애물
+# 수에 따라 맵마다 크게 달라서, 작은 맵에서 잰 값을 큰 맵에 쓰면 터진다 — 6v6 강남역
+# 에서 청크 32가 18.3GB였는데, 같은 값 기준으로 96을 잡았더니 10v10 다중 맵에서
+# 한 번에 24.95GB를 요구하며 OOM이 났다.
+#
+# 16이 47GB GPU에서 10v10 + 장애물 많은 맵까지 안전한 값이다. 여유가 확인되면
+# 환경변수로 올린다.
+ROLLOUT_CHUNK_SIZE = int(os.environ.get("CEM_ROLLOUT_CHUNK_SIZE", "16"))
+NO_ALIVE_BLUE_DISTANCE = math.hypot(WORLD_X_MAX - WORLD_X_MIN, WORLD_Y_MAX - WORLD_Y_MIN)
+
+
+@dataclass(frozen=True)
+class CEMConfig:
+    """CEM 탐색 설정."""
+
+    num_candidates: int = 128
+    num_elites: int = 16
+    num_iterations: int = 4
+    future_horizon: int = 1
+    seed: int = 42
+    smoothing: float = 0.35
+    initial_move_std: float = 0.45
+    min_move_std: float = 0.05
+    initial_turn_std: float = math.pi
+    min_turn_std: float = 0.05
+    min_action_probability: float = 0.02
+    action_prior: tuple[float, float, float, float] = DEFAULT_ACTION_PRIOR
+    # 마지막 iteration에서 step 1~ ENGAGE 표적을 그 스텝의 예측 상태로 다시 뽑는다.
+    # 그 iteration만 rollout이 2배가 된다.
+    retarget_engage: bool = RETARGET_ENGAGE
+
+    def __post_init__(self) -> None:
+        """CEM 설정값을 즉시 검증한다."""
+        if self.num_candidates <= 0:
+            raise ValueError("num_candidates는 0보다 커야 한다")
+        if self.num_elites <= 0:
+            raise ValueError("num_elites는 0보다 커야 한다")
+        if self.num_elites > self.num_candidates:
+            raise ValueError("num_elites는 num_candidates보다 클 수 없다")
+        if self.num_iterations <= 0:
+            raise ValueError("num_iterations는 0보다 커야 한다")
+        if self.future_horizon <= 0:
+            raise ValueError("future_horizon은 0보다 커야 한다")
+        if not 0.0 <= self.smoothing < 1.0:
+            raise ValueError("smoothing은 [0, 1) 범위여야 한다")
+        if self.initial_move_std <= 0.0:
+            raise ValueError("initial_move_std는 0보다 커야 한다")
+        if self.min_move_std <= 0.0:
+            raise ValueError("min_move_std는 0보다 커야 한다")
+        if self.initial_turn_std <= 0.0:
+            raise ValueError("initial_turn_std는 0보다 커야 한다")
+        if self.min_turn_std <= 0.0:
+            raise ValueError("min_turn_std는 0보다 커야 한다")
+        if self.min_action_probability < 0.0:
+            raise ValueError("min_action_probability는 음수일 수 없다")
+        if len(self.action_prior) != ACTION_TYPE_COUNT:
+            raise ValueError(f"action_prior 길이는 {ACTION_TYPE_COUNT}이어야 한다")
+
+
+@dataclass(frozen=True)
+class CEMDistribution:
+    """CEM이 갱신하는 torch action 분포."""
+
+    action_probs: torch.Tensor
+    move_mean: torch.Tensor
+    move_std: torch.Tensor
+    turn_mean: torch.Tensor
+    turn_std: torch.Tensor
+    target_probs: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """분포 shape와 확률값을 검증한다."""
+        _expect_rank("action_probs", self.action_probs, 3)
+        _expect_rank("move_mean", self.move_mean, 3)
+        _expect_rank("move_std", self.move_std, 3)
+        _expect_rank("turn_mean", self.turn_mean, 2)
+        _expect_rank("turn_std", self.turn_std, 2)
+        _expect_rank("target_probs", self.target_probs, 3)
+        horizon, num_units, action_count = self.action_probs.shape
+        if action_count != ACTION_TYPE_COUNT:
+            raise ValueError(f"action_probs 마지막 차원은 {ACTION_TYPE_COUNT}이어야 한다")
+        if self.move_mean.shape != (horizon, num_units, 2):
+            raise ValueError("move_mean shape는 (H, U, 2)이어야 한다")
+        if self.move_std.shape != (horizon, num_units, 2):
+            raise ValueError("move_std shape는 (H, U, 2)이어야 한다")
+        if self.turn_mean.shape != (horizon, num_units):
+            raise ValueError("turn_mean shape는 (H, U)이어야 한다")
+        if self.turn_std.shape != (horizon, num_units):
+            raise ValueError("turn_std shape는 (H, U)이어야 한다")
+        if self.target_probs.shape[:2] != (horizon, num_units):
+            raise ValueError("target_probs 앞 두 차원은 (H, U)이어야 한다")
+        _expect_probability_rows("action_probs", self.action_probs)
+        _expect_probability_rows("target_probs", self.target_probs)
+        _expect_positive("move_std", self.move_std)
+        _expect_positive("turn_std", self.turn_std)
+
+
+@dataclass(frozen=True)
+class FutureActionPlanBatch:
+    """CEM이 샘플링한 미래 joint action 후보 묶음."""
+
+    action_features: torch.Tensor
+    action_unit_ids: torch.Tensor
+    issued_mask: torch.Tensor
+    action_type_ids: torch.Tensor
+    target_entity_ids: torch.Tensor
+    target_indices: torch.Tensor
+    move_xy_norm: torch.Tensor
+    theta_radians: torch.Tensor
+    red_target_ids: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """후보 action batch의 shape 계약을 검증한다."""
+        _expect_rank("action_features", self.action_features, 4)
+        _expect_rank("action_unit_ids", self.action_unit_ids, 3)
+        _expect_rank("issued_mask", self.issued_mask, 3)
+        _expect_rank("action_type_ids", self.action_type_ids, 3)
+        _expect_rank("target_entity_ids", self.target_entity_ids, 3)
+        _expect_rank("target_indices", self.target_indices, 3)
+        _expect_rank("move_xy_norm", self.move_xy_norm, 4)
+        _expect_rank("theta_radians", self.theta_radians, 3)
+        _expect_rank("red_target_ids", self.red_target_ids, 1)
+        candidates, horizon, num_units, action_dim = self.action_features.shape
+        common = (candidates, horizon, num_units)
+        if action_dim != ACTION_DIM:
+            raise ValueError(f"action_features 마지막 차원은 {ACTION_DIM}이어야 한다")
+        if self.action_unit_ids.shape != common:
+            raise ValueError("action_unit_ids shape는 (C, H, U)이어야 한다")
+        if self.issued_mask.shape != common:
+            raise ValueError("issued_mask shape는 (C, H, U)이어야 한다")
+        if self.action_type_ids.shape != common:
+            raise ValueError("action_type_ids shape는 (C, H, U)이어야 한다")
+        if self.target_entity_ids.shape != common:
+            raise ValueError("target_entity_ids shape는 (C, H, U)이어야 한다")
+        if self.target_indices.shape != common:
+            raise ValueError("target_indices shape는 (C, H, U)이어야 한다")
+        if self.move_xy_norm.shape != common + (2,):
+            raise ValueError("move_xy_norm shape는 (C, H, U, 2)이어야 한다")
+        if self.theta_radians.shape != common:
+            raise ValueError("theta_radians shape는 (C, H, U)이어야 한다")
+        if self.red_target_ids.numel() <= 0:
+            raise ValueError("red_target_ids가 비어 있으면 ENGAGE 후보를 만들 수 없다")
+        _expect_bool("issued_mask", self.issued_mask)
+        _expect_finite("action_features", self.action_features)
+        _expect_finite("move_xy_norm", self.move_xy_norm)
+        _expect_finite("theta_radians", self.theta_radians)
+
+    def take_candidates(self, indices: torch.Tensor) -> "FutureActionPlanBatch":
+        """일부 candidate만 잘라 같은 구조로 반환한다."""
+        _expect_rank("indices", indices, 1)
+        indices = indices.to(device=self.action_features.device, dtype=torch.long)
+        return FutureActionPlanBatch(
+            action_features=self.action_features.index_select(0, indices),
+            action_unit_ids=self.action_unit_ids.index_select(0, indices),
+            issued_mask=self.issued_mask.index_select(0, indices),
+            action_type_ids=self.action_type_ids.index_select(0, indices),
+            target_entity_ids=self.target_entity_ids.index_select(0, indices),
+            target_indices=self.target_indices.index_select(0, indices),
+            move_xy_norm=self.move_xy_norm.index_select(0, indices),
+            theta_radians=self.theta_radians.index_select(0, indices),
+            red_target_ids=self.red_target_ids,
+        )
+
+
+@dataclass(frozen=True)
+class ObservedActionWindow:
+    """월드모델 history 구간에 해당하는 관측 전이 action."""
+
+    action_features: torch.Tensor
+    action_unit_ids: torch.Tensor
+    issued_mask: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """history action window shape를 검증한다."""
+        _expect_rank("action_features", self.action_features, 3)
+        _expect_rank("action_unit_ids", self.action_unit_ids, 2)
+        _expect_rank("issued_mask", self.issued_mask, 2)
+        if self.action_features.shape[:2] != self.action_unit_ids.shape:
+            raise ValueError("action_features와 action_unit_ids의 시간/유닛 차원이 같아야 한다")
+        if self.issued_mask.shape != self.action_unit_ids.shape:
+            raise ValueError("issued_mask shape는 action_unit_ids shape와 같아야 한다")
+        if self.action_features.shape[-1] != ACTION_DIM:
+            raise ValueError(f"action_features 마지막 차원은 {ACTION_DIM}이어야 한다")
+        _expect_bool("issued_mask", self.issued_mask)
+        _expect_finite("action_features", self.action_features)
+
+
+@dataclass(frozen=True)
+class CEMIterationStats:
+    """한 CEM iteration의 요약값."""
+
+    iteration: int
+    best_score: float
+    elite_mean: float
+    population_mean: float
+
+
+@dataclass(frozen=True)
+class CEMResult:
+    """CEM 최적화 결과."""
+
+    best_score: float
+    best_plan: FutureActionPlanBatch
+    final_distribution: CEMDistribution
+    iteration_stats: tuple[CEMIterationStats, ...]
+
+
+def _expect_rank(name: str, value: torch.Tensor, rank: int) -> None:
+    """torch tensor rank 계약을 즉시 검증한다."""
+    if value.ndim != rank:
+        raise ValueError(f"{name} rank는 {rank}이어야 한다: shape={tuple(value.shape)}")
+
+
+def _expect_bool(name: str, value: torch.Tensor) -> None:
+    """mask tensor는 bool dtype만 허용한다."""
+    if value.dtype != torch.bool:
+        raise TypeError(f"{name} dtype은 torch.bool이어야 한다: dtype={value.dtype}")
+
+
+def _expect_finite(name: str, value: torch.Tensor) -> None:
+    """NaN/Inf가 분포와 점수에 섞이지 않게 한다."""
+    if not torch.isfinite(value).all():
+        raise ValueError(f"{name}에는 NaN 또는 Inf가 있으면 안 된다")
+
+
+def _expect_positive(name: str, value: torch.Tensor) -> None:
+    """표준편차 등 양수 tensor를 검증한다."""
+    _expect_finite(name, value)
+    if torch.any(value <= 0.0):
+        raise ValueError(f"{name}는 모두 0보다 커야 한다")
+
+
+def _expect_probability_rows(name: str, value: torch.Tensor) -> None:
+    """마지막 차원의 categorical 확률 합이 1인지 검증한다."""
+    _expect_finite(name, value)
+    if torch.any(value < 0.0):
+        raise ValueError(f"{name}에는 음수 확률이 있으면 안 된다")
+    if not torch.allclose(value.sum(dim=-1), torch.ones_like(value.sum(dim=-1)), atol=1e-5):
+        raise ValueError(f"{name}의 마지막 차원 합은 1이어야 한다")
+
+
+def _normalized_probability(values: torch.Tensor) -> torch.Tensor:
+    """명시적으로 양수 합을 가진 확률 벡터를 정규화한다."""
+    _expect_rank("values", values, 1)
+    _expect_finite("values", values)
+    if torch.any(values < 0.0):
+        raise ValueError("확률 값에는 음수가 있으면 안 된다")
+    total = values.sum()
+    if float(total.detach().cpu().item()) <= 0.0:
+        raise ValueError("확률 합은 0보다 커야 한다")
+    return (values / total).float()
+
+
+# MOVE 한 스텝의 최대 이동거리(유닛). devs_rollout의 next_waypoint max_step과 같아야 한다.
+MAX_MOVE_PER_STEP = 1.5
+# 자유공간 후보점 캐시. 맵마다 largest_free_component가 비싸서 장애물 서명으로 재사용한다.
+_FREE_POINT_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _obstacles_from_batch(current_batch: SlotBatch) -> list[tuple[float, float, float, float]]:
+    """slot batch의 terrain feature에서 AABB 장애물을 복원한다."""
+    rects: list[tuple[float, float, float, float]] = []
+    for index, type_id in enumerate(current_batch.type_ids):
+        if int(type_id) != int(ObjectType.TERRAIN):
+            continue
+        f = current_batch.features[index]
+        cx = float(f[1]) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + (WORLD_X_MAX + WORLD_X_MIN) * 0.5
+        cy = float(f[2]) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + (WORLD_Y_MAX + WORLD_Y_MIN) * 0.5
+        w = float(f[3]) * (WORLD_X_MAX - WORLD_X_MIN)
+        h = float(f[4]) * (WORLD_Y_MAX - WORLD_Y_MIN)
+        rects.append((cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0))
+    return rects
+
+
+def _free_points(current_batch: SlotBatch) -> np.ndarray:
+    """이동 가능한 자유공간 격자점 (M, 2). 맵당 한 번만 계산한다."""
+    rects = _obstacles_from_batch(current_batch)
+    key = tuple(round(v, 3) for rect in rects for v in rect)
+    cached = _FREE_POINT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    points = component_points(largest_free_component(rects))
+    array = np.asarray(points, dtype=np.float32) if points else np.zeros((0, 2), dtype=np.float32)
+    _FREE_POINT_CACHE[key] = array
+    return array
+
+
+def _sample_structured_action_types(
+    *,
+    base_probs: torch.Tensor,
+    candidates: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    """후보마다 성향과 국면을 달리해 액션 종류 시퀀스를 만든다.
+
+    고정 prior에서 스텝/유닛마다 독립 추출하면, 유닛 5명 x 6스텝 = 30회 추출의 큰 수
+    법칙으로 **집계 비율이 prior 평균에 몰린다.** 실측에서 후보의 79%가 교전태세 격자
+    한 칸에 들어가 MAP-Elites가 사실상 1칸만 쓴다. prior 값을 바꿔도 몰리는 위치만
+    옮겨갈 뿐 퍼지지 않는다.
+
+    그래서 세 가지를 후보 단위로 뽑는다.
+
+    - 시작/끝 분포를 Dirichlet에서 각각 뽑아 **후보 간 비율을 퍼뜨린다.**
+      어떤 후보는 기동 위주, 어떤 후보는 교전 위주가 된다.
+    - 두 분포를 스텝에 걸쳐 보간해 **국면 순서를 만든다.** 시작이 MOVE 우세,
+      끝이 ENGAGE 우세면 "접근 후 교전"이 자연히 나온다. 전술 어휘를 손으로
+      정하지 않고 두 끝점 추출에서 나오게 한다.
+    - 점착도를 뽑아 **구간 길이를 다양하게 한다.** 보간만으로는 스텝별 추출이 여전히
+      독립이라 구간이 안 길어진다. 직전 액션을 확률 s로 이어가야 늘어난다.
+
+    base_probs는 CEM 반복이 갱신한 분포다. 첫 반복에서는 균등에 가깝고, 반복이
+    진행되면 elite 쪽으로 좁혀진다. 여기서 뽑은 후보별 성향을 base_probs와 곱해
+    CEM의 학습 결과를 버리지 않는다.
+    """
+    horizon, num_units, num_types = base_probs.shape
+
+    # Dirichlet은 numpy로 뽑는다. torch._standard_gamma는 generator를 안 받아 전역
+    # RNG를 쓰고, 그러면 같은 seed로도 결과가 달라져 학습이 재현되지 않는다.
+    # u^(1/a)*Exp(1) 근사는 a<1에서도 정확하지 않아(평균이 5%쯤 어긋난다) 쓰지 않는다.
+    numpy_seed = int(
+        torch.randint(0, 2**31 - 1, (1,), generator=generator, device=device).item()
+    )
+    rng = np.random.default_rng(numpy_seed)
+    alpha_np = np.asarray(CANDIDATE_MIX_ALPHA, dtype=np.float64)
+
+    def draw_mix() -> torch.Tensor:
+        drawn = rng.dirichlet(alpha_np, size=candidates)
+        return torch.as_tensor(drawn, dtype=torch.float32, device=device)
+
+    start_mix = draw_mix()
+    end_mix = draw_mix()
+    steps = torch.linspace(0.0, 1.0, horizon, device=device).reshape(1, horizon, 1)
+    # (C, H, T) 후보별 국면 분포
+    phase = start_mix.unsqueeze(1) + steps * (end_mix - start_mix).unsqueeze(1)
+    phase = phase.clamp_min(1e-6)
+
+    # base_probs를 그대로 곱하면 기존 prior(DEFAULT_ACTION_PRIOR) 쪽으로 끌려가
+    # 후보 평균이 CANDIDATE_MIX_ALPHA와 어긋난다. 초기 prior 대비 "비"만 곱해
+    # CEM 반복이 갱신한 정보만 반영한다. 첫 반복에서는 비가 1이라 순수 Dirichlet이고,
+    # engage hard mask가 0으로 만든 항목은 비도 0이라 마스크가 유지된다.
+    prior = torch.tensor(DEFAULT_ACTION_PRIOR, dtype=torch.float32, device=device)
+    modulation = base_probs / prior.reshape(1, 1, num_types).clamp_min(1e-8)
+    combined = phase.unsqueeze(2) * modulation.reshape(1, horizon, num_units, num_types)
+    combined = combined.clamp_min(1e-8)
+    combined = combined / combined.sum(dim=-1, keepdim=True)
+
+    low, high = STICKINESS_RANGE
+    stickiness = low + (high - low) * torch.rand(
+        (candidates, 1), generator=generator, device=device
+    )
+
+    result = torch.zeros((candidates, horizon, num_units), dtype=torch.long, device=device)
+    previous: torch.Tensor | None = None
+    for step in range(horizon):
+        flat = combined[:, step].reshape(candidates * num_units, num_types)
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(
+            candidates, num_units
+        )
+        if previous is None:
+            current = sampled
+        else:
+            keep = torch.rand((candidates, num_units), generator=generator, device=device) < stickiness
+            current = torch.where(keep, previous, sampled)
+        result[:, step] = current
+        previous = current
+    return result
+
+
+def _polyline_length(points: list[tuple[float, float]]) -> float:
+    """경로 점열의 월드 좌표 길이를 계산한다."""
+    if len(points) < 2:
+        return 0.0
+    return float(
+        sum(
+            math.hypot(b[0] - a[0], b[1] - a[1])
+            for a, b in zip(points, points[1:])
+        )
+    )
+
+
+def _astar_reachable_mask(
+    *,
+    anchors: torch.Tensor,
+    budgets: torch.Tensor,
+    free_tensor: torch.Tensor,
+    obstacles: list[tuple[float, float, float, float]],
+    euclidean_within: torch.Tensor,
+) -> torch.Tensor:
+    """유클리드 후보를 실제 A* 경로 길이로 다시 걸러낸다."""
+    _expect_rank("anchors", anchors, 2)
+    _expect_rank("budgets", budgets, 1)
+    _expect_rank("free_tensor", free_tensor, 2)
+    _expect_rank("euclidean_within", euclidean_within, 2)
+    if anchors.shape[0] != budgets.shape[0]:
+        raise ValueError("anchors와 budgets의 batch 크기가 같아야 한다")
+    if euclidean_within.shape != (anchors.shape[0], free_tensor.shape[0]):
+        raise ValueError("euclidean_within shape가 anchors/free_tensor와 맞지 않는다")
+
+    anchors_np = anchors.detach().cpu().numpy()
+    budgets_np = budgets.detach().cpu().numpy()
+    free_np = free_tensor.detach().cpu().numpy()
+    euclidean_np = euclidean_within.detach().cpu().numpy()
+    reachable_np = np.zeros_like(euclidean_np, dtype=np.bool_)
+    row_cache: dict[tuple[float, float, float], np.ndarray] = {}
+
+    for row_index, budget in enumerate(budgets_np):
+        budget_value = float(budget)
+        if budget_value <= 0.0:
+            continue
+        start = (float(anchors_np[row_index, 0]), float(anchors_np[row_index, 1]))
+        cache_key = (round(start[0], 3), round(start[1], 3), round(budget_value, 3))
+        cached = row_cache.get(cache_key)
+        if cached is not None:
+            reachable_np[row_index] = cached
+            continue
+        row_reachable = np.zeros(free_np.shape[0], dtype=np.bool_)
+        for point_index in np.flatnonzero(euclidean_np[row_index]):
+            goal = (float(free_np[point_index, 0]), float(free_np[point_index, 1]))
+            path = astar_path(start, goal, obstacles)
+            if path is not None and _polyline_length(path) <= budget_value + 1e-6:
+                row_reachable[point_index] = True
+        row_cache[cache_key] = row_reachable
+        reachable_np[row_index] = row_reachable
+
+    return torch.as_tensor(reachable_np, dtype=torch.bool, device=anchors.device)
+
+
+def _sample_free_within(
+    anchor: torch.Tensor,
+    budget: torch.Tensor,
+    free_tensor: torch.Tensor,
+    obstacles: list[tuple[float, float, float, float]],
+    move_mean: torch.Tensor,
+    move_std: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """A*로 도달 가능한 자유공간 중 CEM MOVE Gaussian에 따라 목적지를 샘플링한다.
+
+    유클리드 거리로 불가능한 점을 먼저 버린 뒤, 남은 후보만 `terrain.astar_path`의
+    실제 경로 길이로 검증한다. free-space 점은 [-1, 1] 정규좌표로 바꿔
+    move_mean/std와 같은 좌표계에서 Gaussian likelihood를 계산한다.
+    """
+    flat_anchor = anchor.reshape(-1, 2)
+    flat_budget = budget.reshape(-1)
+
+    # 실제 경로 길이는 유클리드 거리보다 짧을 수 없으므로 먼저 싸게 후보를 줄인다.
+    distance = torch.cdist(flat_anchor, free_tensor)  # (N, M), 유클리드 하한
+    euclidean_within = distance <= flat_budget.unsqueeze(1)
+    within = _astar_reachable_mask(
+        anchors=flat_anchor,
+        budgets=flat_budget,
+        free_tensor=free_tensor,
+        obstacles=obstacles,
+        euclidean_within=euclidean_within,
+    )
+
+    # 격자 해상도/경로 제약 때문에 budget 안에 점이 하나도 없을 수 있다. 이 경우에는
+    # softmax가 깨지지 않게 임시로 가장 가까운 점을 열어 두고, 최종 반환은 현재 위치로
+    # 되돌린다. 그래야 MOVE step이 도달 불가능한 목적지를 학습하지 않는다.
+    has_reachable = within.any(dim=1)
+    missing_rows = torch.nonzero(~has_reachable, as_tuple=False).flatten()
+    if missing_rows.numel() > 0:
+        nearest = distance.argmin(dim=1)
+        within[missing_rows, nearest.index_select(0, missing_rows)] = True
+
+    # free-space 점을 CEM MOVE 분포와 같은 [-1, 1] 정규좌표로 변환한다.
+    free_norm_x = (
+        (free_tensor[:, 0] - WORLD_X_MIN)
+        / (WORLD_X_MAX - WORLD_X_MIN)
+        * 2.0
+        - 1.0
+    )
+    free_norm_y = (
+        (free_tensor[:, 1] - WORLD_Y_MIN)
+        / (WORLD_Y_MAX - WORLD_Y_MIN)
+        * 2.0
+        - 1.0
+    )
+    free_norm = torch.stack([free_norm_x, free_norm_y], dim=-1)  # (M, 2)
+
+    mean = move_mean.reshape(-1, 2)
+    std = move_std.reshape(-1, 2).clamp_min(1e-6)
+    if mean.shape[0] != flat_anchor.shape[0] or std.shape[0] != flat_anchor.shape[0]:
+        raise ValueError("move_mean/std의 batch 크기는 anchor와 같아야 한다")
+
+    # 각 free-space 점의 diagonal Gaussian log-likelihood.
+    delta = (free_norm.unsqueeze(0) - mean.unsqueeze(1)) / std.unsqueeze(1)
+    logits = -0.5 * torch.square(delta).sum(dim=-1)
+    logits = logits.masked_fill(~within, float("-inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    picked = torch.multinomial(probs, 1, generator=generator).squeeze(1)
+    picked_points = free_tensor.index_select(0, picked)
+    if missing_rows.numel() > 0:
+        picked_points[missing_rows] = flat_anchor.index_select(0, missing_rows)
+    return picked_points.reshape(anchor.shape)
+
+
+def _sample_reachable_move_targets(
+    *,
+    current_batch: SlotBatch,
+    distribution: CEMDistribution,
+    blue_indices: torch.Tensor,
+    action_type_ids: torch.Tensor,
+    issued_mask: torch.Tensor,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """MOVE 목적지를 step별 1틱 이동 가능 거리 안에서 CEM 분포로 뽑는다.
+
+    - 연속 MOVE여도 합치지 않고 각 step이 자기 목적지를 직접 가진다.
+    - 각 MOVE step은 `MAX_MOVE_PER_STEP` 예산 안의 reachable free-space에서 뽑는다.
+    - 그 reachable 점들 중 `distribution.move_mean/std[step, unit]`의
+      Gaussian likelihood가 높은 점을 더 자주 뽑는다.
+    - 다음 step의 anchor는 직전 MOVE 목적지다. 비-MOVE step은 위치를 그대로 둔다.
+
+    반환 None은 자유공간 정보를 얻지 못한 경우이며 호출부가 기존 Gaussian sample을
+    fallback으로 사용한다.
+    """
+    obstacles = _obstacles_from_batch(current_batch)
+    free = _free_points(current_batch)
+    if free.shape[0] == 0:
+        return None
+
+    features = _batch_tensor(current_batch, "features", device=device).float()
+    normalized = features.index_select(0, blue_indices)[:, [UNIT_X_INDEX, UNIT_Y_INDEX]]
+    start = torch.stack(
+        [
+            (normalized[:, 0] + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
+            (normalized[:, 1] + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
+        ],
+        dim=-1,
+    )
+
+    candidates, horizon, num_units = action_type_ids.shape
+    if distribution.move_mean.shape != (horizon, num_units, 2):
+        raise ValueError("distribution.move_mean shape가 action plan의 (H, U, 2)와 맞지 않는다")
+    if distribution.move_std.shape != (horizon, num_units, 2):
+        raise ValueError("distribution.move_std shape가 action plan의 (H, U, 2)와 맞지 않는다")
+
+    free_tensor = torch.as_tensor(free, dtype=torch.float32, device=device)
+    is_move = (action_type_ids == int(ActionType.MOVE)) & issued_mask
+
+    anchor = start.reshape(1, num_units, 2).expand(candidates, num_units, 2).contiguous()
+    current_target = anchor.clone()
+    targets = torch.zeros(
+        (candidates, horizon, num_units, 2),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    for step in range(horizon):
+        budget = is_move[:, step].float() * float(MAX_MOVE_PER_STEP)
+
+        step_move_mean = (
+            distribution.move_mean[step]
+            .unsqueeze(0)
+            .expand(candidates, num_units, 2)
+        )
+        step_move_std = (
+            distribution.move_std[step]
+            .unsqueeze(0)
+            .expand(candidates, num_units, 2)
+        )
+
+        sampled = _sample_free_within(
+            anchor,
+            budget,
+            free_tensor,
+            obstacles,
+            step_move_mean,
+            step_move_std,
+            generator,
+        )
+
+        move_now = is_move[:, step].unsqueeze(-1)
+        current_target = torch.where(move_now, sampled, anchor)
+        targets[:, step] = current_target
+        anchor = current_target
+
+    norm_x = (
+        (targets[..., 0] - WORLD_X_MIN)
+        / (WORLD_X_MAX - WORLD_X_MIN)
+        * 2.0
+        - 1.0
+    )
+    norm_y = (
+        (targets[..., 1] - WORLD_Y_MIN)
+        / (WORLD_Y_MAX - WORLD_Y_MIN)
+        * 2.0
+        - 1.0
+    )
+    return _clip_move_xy(torch.stack([norm_x, norm_y], dim=-1))
+
+
+def _clip_move_xy(values: torch.Tensor) -> torch.Tensor:
+    """정규화 좌표를 [-1, 1] 범위로 제한한다."""
+    return torch.clamp(values, -1.0, 1.0).float()
+
+
+def _wrap_radians(values: torch.Tensor) -> torch.Tensor:
+    """각도를 [-pi, pi] 범위로 접는다."""
+    return torch.remainder(values + math.pi, 2.0 * math.pi).sub(math.pi).float()
+
+
+def _batch_tensor(batch: SlotBatch, name: str, *, device: torch.device) -> torch.Tensor:
+    """SlotBatch의 numpy 배열을 지정 device tensor로 변환한다."""
+    value = getattr(batch, name)
+    return torch.as_tensor(value, device=device)
+
+
+def _team_slot_indices(batch: SlotBatch, team_id: TeamId, *, device: torch.device) -> torch.Tensor:
+    """특정 팀 unit slot index를 반환한다."""
+    type_ids = _batch_tensor(batch, "type_ids", device=device)
+    team_ids = _batch_tensor(batch, "team_ids", device=device)
+    indices = torch.nonzero((type_ids == int(ObjectType.UNIT)) & (team_ids == int(team_id)), as_tuple=False).flatten()
+    if indices.numel() == 0:
+        raise ValueError(f"{team_id.name} unit slot이 하나도 없다")
+    return indices.long()
+
+
+def _mission_index(batch: SlotBatch, *, device: torch.device) -> int:
+    """mission slot index를 반환한다."""
+    type_ids = _batch_tensor(batch, "type_ids", device=device)
+    indices = torch.nonzero(type_ids == int(ObjectType.MISSION), as_tuple=False).flatten()
+    if indices.shape != (1,):
+        raise ValueError(f"mission slot은 정확히 하나여야 한다: count={indices.numel()}")
+    return int(indices[0].detach().cpu().item())
+
+
+def blue_unit_ids(batch: SlotBatch, *, device: torch.device) -> torch.Tensor:
+    """SlotBatch에서 CEM 대상 BLUE unit id를 slot 순서대로 반환한다."""
+    indices = _team_slot_indices(batch, TeamId.BLUE, device=device)
+    entity_ids = _batch_tensor(batch, "entity_ids", device=device).long()
+    return entity_ids.index_select(0, indices)
+
+
+def red_target_table(batch: SlotBatch, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """ENGAGE 후보에 사용할 RED target id와 현재 좌표를 반환한다."""
+    indices = _team_slot_indices(batch, TeamId.RED, device=device)
+    entity_ids = _batch_tensor(batch, "entity_ids", device=device).long()
+    features = _batch_tensor(batch, "features", device=device).float()
+    target_ids = entity_ids.index_select(0, indices)
+    target_xy = features.index_select(0, indices)[:, [UNIT_X_INDEX, UNIT_Y_INDEX]]
+    return target_ids, _clip_move_xy(target_xy)
+
+
+def alive_blue_mask(batch: SlotBatch, *, device: torch.device) -> torch.Tensor:
+    """현재 state에서 명령을 받을 수 있는 BLUE unit mask를 반환한다."""
+    indices = _team_slot_indices(batch, TeamId.BLUE, device=device)
+    features = _batch_tensor(batch, "features", device=device).float()
+    return features.index_select(0, indices)[:, UNIT_ALIVE_INDEX] >= 0.5
+
+
+def build_initial_distribution(current_batch: SlotBatch, config: CEMConfig, *, device: torch.device) -> CEMDistribution:
+    """현재 DEVS state로 CEM 초기 분포를 만든다."""
+    blue_indices = _team_slot_indices(current_batch, TeamId.BLUE, device=device)
+    _, red_xy = red_target_table(current_batch, device=device)
+    features = _batch_tensor(current_batch, "features", device=device).float()
+    horizon = config.future_horizon
+    num_blue = int(blue_indices.numel())
+    num_red = int(red_xy.shape[0])
+
+    prior = _normalized_probability(torch.tensor(config.action_prior, dtype=torch.float32, device=device))
+    action_probs = prior.reshape(1, 1, ACTION_TYPE_COUNT).expand(horizon, num_blue, ACTION_TYPE_COUNT).clone()
+
+    # 초기 목적지 분포는 현재 위치 중심에 initial_move_std로 넓게 둔다. 이 std는
+    # 정규좌표 0.45(월드 9유닛)라 1틱 이동 예산 안에서는 비교적 넓게 탐색한다.
+    # 이후 iteration부터 엘리트가 좁힌다.
+    #
+    # 전에는 목표 지점까지 직선 보간을 초기 평균으로 썼다. move_mean이 실제로
+    # 샘플링에 쓰이게 된 지금 그대로 두면 "목표로 가라"는 전술 판단을 제안 분포에
+    # 다시 넣는 셈이라 현재 위치로 바꿨다.
+    current_xy = features.index_select(0, blue_indices)[:, [UNIT_X_INDEX, UNIT_Y_INDEX]]
+    move_mean = _clip_move_xy(
+        current_xy.reshape(1, num_blue, 2).expand(horizon, num_blue, 2).clone()
+    )
+    move_std = torch.full((horizon, num_blue, 2), config.initial_move_std, dtype=torch.float32, device=device)
+
+    turn_mean = torch.zeros((horizon, num_blue), dtype=torch.float32, device=device)
+    turn_std = torch.full((horizon, num_blue), config.initial_turn_std, dtype=torch.float32, device=device)
+    target_probs = torch.full((horizon, num_blue, num_red), 1.0 / float(num_red), dtype=torch.float32, device=device)
+    return CEMDistribution(
+        action_probs=action_probs,
+        move_mean=move_mean,
+        move_std=move_std,
+        turn_mean=turn_mean,
+        turn_std=turn_std,
+        target_probs=target_probs,
+    )
+
+
+def _sample_categorical(
+    probabilities: torch.Tensor,
+    *,
+    sample_count: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """categorical 분포에서 index를 샘플링한다."""
+    _expect_rank("probabilities", probabilities, 2)
+    return torch.multinomial(probabilities, sample_count, replacement=True, generator=generator).transpose(0, 1).long()
+
+
+def sample_future_action_plans(
+    *,
+    distribution: CEMDistribution,
+    current_batch: SlotBatch,
+    config: CEMConfig,
+    generator: torch.Generator,
+    device: torch.device,
+) -> FutureActionPlanBatch:
+    """현재 CEM 분포에서 미래 joint action 후보들을 샘플링한다."""
+    unit_ids = blue_unit_ids(current_batch, device=device)
+    issued_unit_mask = alive_blue_mask(current_batch, device=device)
+    blue_indices = _team_slot_indices(current_batch, TeamId.BLUE, device=device)
+    red_ids, red_xy = red_target_table(current_batch, device=device)
+    horizon, num_units, _ = distribution.action_probs.shape
+    if horizon != config.future_horizon:
+        raise ValueError("distribution horizon과 config.future_horizon이 같아야 한다")
+    if num_units != unit_ids.numel():
+        raise ValueError("distribution unit 수와 current_batch BLUE unit 수가 같아야 한다")
+
+    candidates = config.num_candidates
+    action_features = torch.zeros(
+        (candidates, horizon, num_units, ACTION_DIM),
+        dtype=torch.float32,
+        device=device,
+    )
+    action_unit_ids = (
+        unit_ids.reshape(1, 1, num_units)
+        .expand(candidates, horizon, num_units)
+        .clone()
+    )
+    issued_mask = (
+        issued_unit_mask.reshape(1, 1, num_units)
+        .expand(candidates, horizon, num_units)
+        .clone()
+    )
+    action_type_ids = torch.full(
+        (candidates, horizon, num_units),
+        NO_COMMAND_TYPE_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    target_entity_ids = torch.full(
+        (candidates, horizon, num_units),
+        NO_TARGET_ENTITY_ID,
+        dtype=torch.long,
+        device=device,
+    )
+
+    # 자유공간 정보를 얻지 못했을 때 사용할 fallback MOVE sample. 정상 경로에서는 아래
+    # _sample_reachable_move_targets가 같은 CEM distribution을 반영한 reachable target으로
+    # 교체한다.
+    move_xy_norm = _clip_move_xy(
+        torch.normal(
+            mean=distribution.move_mean.reshape(1, horizon, num_units, 2).expand(
+                candidates, horizon, num_units, 2
+            ),
+            std=distribution.move_std.reshape(1, horizon, num_units, 2).expand(
+                candidates, horizon, num_units, 2
+            ),
+            generator=generator,
+        )
+    )
+    theta_radians = _wrap_radians(
+        torch.normal(
+            mean=distribution.turn_mean.reshape(1, horizon, num_units).expand(
+                candidates, horizon, num_units
+            ),
+            std=distribution.turn_std.reshape(1, horizon, num_units).expand(
+                candidates, horizon, num_units
+            ),
+            generator=generator,
+        )
+    )
+
+    action_type_ids = _sample_structured_action_types(
+        base_probs=distribution.action_probs,
+        candidates=candidates,
+        generator=generator,
+        device=device,
+    )
+
+    flat_target_probs = distribution.target_probs.reshape(
+        horizon * num_units,
+        distribution.target_probs.shape[-1],
+    )
+    sampled_targets = _sample_categorical(
+        flat_target_probs,
+        sample_count=candidates,
+        generator=generator,
+    )
+    target_indices = sampled_targets.reshape(candidates, horizon, num_units)
+
+    # action type이 정해진 뒤 MOVE step만 1틱 이동 예산 안에서 reachable free-space를
+    # 구하고, distribution.move_mean/std의 Gaussian으로 가중 샘플링한다.
+    reachable = _sample_reachable_move_targets(
+        current_batch=current_batch,
+        distribution=distribution,
+        blue_indices=blue_indices,
+        action_type_ids=action_type_ids,
+        issued_mask=issued_mask,
+        generator=generator,
+        device=device,
+    )
+    if reachable is not None:
+        move_xy_norm = reachable
+
+    action_features[..., 0] = action_type_ids.float()
+
+    move_mask = issued_mask & (action_type_ids == int(ActionType.MOVE))
+    action_features[..., 1][move_mask] = 1.0
+    action_features[..., MOVE_X_INDEX][move_mask] = move_xy_norm[..., 0][move_mask]
+    action_features[..., MOVE_Y_INDEX][move_mask] = move_xy_norm[..., 1][move_mask]
+
+    engage_mask = issued_mask & (action_type_ids == int(ActionType.ENGAGE))
+    selected_red_xy = red_xy.index_select(0, target_indices.reshape(-1)).reshape(
+        candidates, horizon, num_units, 2
+    )
+    selected_red_ids = red_ids.index_select(0, target_indices.reshape(-1)).reshape(
+        candidates, horizon, num_units
+    )
+    action_features[..., 4][engage_mask] = 1.0
+    action_features[..., TARGET_TEAM_INDEX][engage_mask] = float(TeamId.RED)
+    action_features[..., TARGET_X_INDEX][engage_mask] = selected_red_xy[..., 0][engage_mask]
+    action_features[..., TARGET_Y_INDEX][engage_mask] = selected_red_xy[..., 1][engage_mask]
+    target_entity_ids[engage_mask] = selected_red_ids[engage_mask]
+
+    turn_mask = issued_mask & (action_type_ids == int(ActionType.TURN))
+    action_features[..., 8][turn_mask] = 1.0
+    action_features[..., THETA_COS_INDEX][turn_mask] = torch.cos(theta_radians)[turn_mask]
+    action_features[..., THETA_SIN_INDEX][turn_mask] = torch.sin(theta_radians)[turn_mask]
+
+    action_features[~issued_mask] = 0.0
+    action_type_ids[~issued_mask] = NO_COMMAND_TYPE_ID
+    target_entity_ids[~issued_mask] = NO_TARGET_ENTITY_ID
+
+    return FutureActionPlanBatch(
+        action_features=action_features,
+        action_unit_ids=action_unit_ids,
+        issued_mask=issued_mask,
+        action_type_ids=action_type_ids,
+        target_entity_ids=target_entity_ids,
+        target_indices=target_indices,
+        move_xy_norm=move_xy_norm,
+        theta_radians=theta_radians,
+        red_target_ids=red_ids,
+    )
+
+
+def retarget_engage_from_prediction(
+    *,
+    plan: FutureActionPlanBatch,
+    future_features: torch.Tensor,
+    current_batch: SlotBatch,
+    generator: torch.Generator,
+    device: torch.device,
+) -> FutureActionPlanBatch:
+    """step k의 ENGAGE 표적을 step k 예측 상태에서 다시 뽑는다.
+
+    한 번 rollout해서 각 스텝의 예측 상태를 얻은 뒤, **그 시점에 사거리 안에 있는
+    적 중에서 균등하게** 표적을 다시 뽑는다. 계획을 채점 후에 손보는 게 아니라
+    **채점 전에** 제안을 다듬는 것이라, 최종적으로 채점되는 계획과 실행되는 계획은
+    그대로 일치한다.
+
+    사거리 안에 아무도 없으면 원래 표적을 그대로 둔다. 여기서 액션 종류를 바꾸면
+    계획의 액션 분포가 달라지므로 건드리지 않고, 실행 시점 `_engage_allowed`에서
+    STOP으로 떨어지게 둔다.
+
+    LOS는 보지 않는다. 후보 x 유닛 x 표적마다 광선 판정을 하면 비싸고, 실측에서
+    차단 사유는 사거리 밖 76.8% / LOS 23.2%라 사거리만으로 대부분이 걸러진다.
+
+    step 0은 건드리지 않는다. `_apply_current_engage_hard_mask`가 현재 상태로 이미
+    유효 표적만 남겼고, 그쪽이 예측보다 정확하다.
+
+    시점 대응: action step k는 상태 k -> k+1 전이다. history가 `H`프레임일 때 plan
+    step k의 **직전 상태**는 전체 인덱스 `H-1+k`이고, `future_features[:, j]`는 전체
+    인덱스 `H+j`다. 따라서 plan step k(k>=1)의 직전 상태는 `future_features[:, k-1]`.
+    """
+    _expect_rank("future_features", future_features, 4)
+    candidates, horizon, num_units = plan.action_type_ids.shape
+    if future_features.shape[0] != candidates:
+        raise ValueError("future_features candidate 수가 plan과 같아야 한다")
+    if future_features.shape[1] < horizon - 1:
+        raise ValueError("future_features 예측 길이가 horizon-1보다 짧다")
+    if horizon <= 1:
+        return plan
+
+    red_indices = _team_slot_indices(current_batch, TeamId.RED, device=device)
+    blue_indices = _team_slot_indices(current_batch, TeamId.BLUE, device=device)
+    num_red = int(red_indices.numel())
+    if num_red <= 0 or int(blue_indices.numel()) != num_units:
+        return plan
+
+    span_x = 0.5 * (WORLD_X_MAX - WORLD_X_MIN)
+    span_y = 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN)
+    scale = torch.tensor([span_x, span_y], dtype=torch.float32, device=device)
+
+    target_indices = plan.target_indices.clone()
+    target_entity_ids = plan.target_entity_ids.clone()
+    action_features = plan.action_features.clone()
+    engage_mask = plan.issued_mask & (plan.action_type_ids == int(ActionType.ENGAGE))
+
+    for step in range(1, horizon):
+        step_mask = engage_mask[:, step]
+        if not bool(step_mask.any()):
+            continue
+        state = future_features[:, step - 1].to(device=device, dtype=torch.float32)
+        blue_xy = state.index_select(1, blue_indices)[..., [UNIT_X_INDEX, UNIT_Y_INDEX]]
+        red_state = state.index_select(1, red_indices)
+        red_xy = red_state[..., [UNIT_X_INDEX, UNIT_Y_INDEX]]
+
+        # 정규좌표를 월드 단위로 되돌려야 사거리와 같은 축에서 잰다.
+        delta = (blue_xy.unsqueeze(2) - red_xy.unsqueeze(1)) * scale
+        distance = delta.norm(dim=-1)                                  # (C, U, R)
+
+        alive = red_state[..., UNIT_ALIVE_INDEX] >= 0.5                # (C, R)
+        # 그 시점에 살아 있고 사거리 안에 든 적. 이 안에서 균등하게 뽑는다.
+        shootable = alive.unsqueeze(1) & (distance <= MAX_FIRE_RANGE)   # (C, U, R)
+        has_shootable = shootable.any(dim=-1)                           # (C, U)
+
+        # 사거리 안이 비어 있으면 multinomial이 실패하므로 균등으로 채워 두고,
+        # 아래 keep에서 그 항목을 걸러 원래 표적을 유지한다.
+        weight = torch.where(
+            has_shootable.unsqueeze(-1), shootable.float(), torch.ones_like(shootable, dtype=torch.float32)
+        )
+        sampled = torch.multinomial(
+            weight.reshape(candidates * num_units, num_red), 1, generator=generator
+        ).reshape(candidates, num_units)
+
+        keep = step_mask & has_shootable
+        target_indices[:, step] = torch.where(keep, sampled, target_indices[:, step])
+
+        chosen = target_indices[:, step]
+        target_entity_ids[:, step] = torch.where(
+            keep,
+            plan.red_target_ids.index_select(0, chosen.reshape(-1)).reshape(candidates, num_units),
+            target_entity_ids[:, step],
+        )
+        # 명령이 싣는 표적 좌표도 그 시점 예측 위치로 맞춘다.
+        chosen_xy = _clip_move_xy(
+            torch.gather(red_xy, 1, chosen.unsqueeze(-1).expand(candidates, num_units, 2))
+        )
+        for axis, index in ((0, TARGET_X_INDEX), (1, TARGET_Y_INDEX)):
+            action_features[:, step, :, index] = torch.where(
+                keep, chosen_xy[..., axis], action_features[:, step, :, index]
+            )
+
+    return FutureActionPlanBatch(
+        action_features=action_features,
+        action_unit_ids=plan.action_unit_ids,
+        issued_mask=plan.issued_mask,
+        action_type_ids=plan.action_type_ids,
+        target_entity_ids=target_entity_ids,
+        target_indices=target_indices,
+        move_xy_norm=plan.move_xy_norm,
+        theta_radians=plan.theta_radians,
+        red_target_ids=plan.red_target_ids,
+    )
+
+
+def update_distribution(
+    *,
+    distribution: CEMDistribution,
+    plans: FutureActionPlanBatch,
+    elite_indices: torch.Tensor,
+    config: CEMConfig,
+) -> CEMDistribution:
+    """elite 후보로 CEM 분포를 갱신한다.
+
+    action type은 명령이 발행된 모든 elite로 갱신하고, action별 파라미터는 그 action이
+    실제로 선택된 elite만 사용한다.
+
+    - MOVE   -> move_mean / move_std
+    - ENGAGE -> target_probs
+    - TURN   -> turn_mean / turn_std
+
+    STOP이나 다른 action의 dummy parameter가 해당 분포 통계에 섞이지 않게 한다.
+    """
+    _expect_rank("elite_indices", elite_indices, 1)
+    if elite_indices.numel() != config.num_elites:
+        raise ValueError("elite_indices 길이는 config.num_elites와 같아야 한다")
+    elite_indices = elite_indices.to(
+        device=plans.action_features.device,
+        dtype=torch.long,
+    )
+
+    elite_actions = plans.action_type_ids.index_select(0, elite_indices)
+    elite_targets = plans.target_indices.index_select(0, elite_indices)
+    elite_moves = plans.move_xy_norm.index_select(0, elite_indices)
+    elite_theta = plans.theta_radians.index_select(0, elite_indices)
+    elite_issued = plans.issued_mask.index_select(0, elite_indices)
+
+    action_probs = distribution.action_probs.clone()
+    target_probs = distribution.target_probs.clone()
+    move_mean = distribution.move_mean.clone()
+    move_std = distribution.move_std.clone()
+    turn_mean = distribution.turn_mean.clone()
+    turn_std = distribution.turn_std.clone()
+
+    horizon, num_units, _ = action_probs.shape
+    num_targets = distribution.target_probs.shape[-1]
+
+    for step_index in range(horizon):
+        for unit_index in range(num_units):
+            issued_valid = elite_issued[:, step_index, unit_index]
+            if not bool(issued_valid.any()):
+                continue
+
+            # 1) Action categorical distribution: 발행된 모든 elite action을 사용한다.
+            counts = torch.bincount(
+                elite_actions[issued_valid, step_index, unit_index],
+                minlength=ACTION_TYPE_COUNT,
+            ).float()
+            empirical_action = _normalized_probability(counts)
+            empirical_action = torch.clamp(
+                empirical_action,
+                min=config.min_action_probability,
+            )
+            empirical_action = _normalized_probability(empirical_action)
+            action_probs[step_index, unit_index] = _normalized_probability(
+                config.smoothing * distribution.action_probs[step_index, unit_index]
+                + (1.0 - config.smoothing) * empirical_action
+            )
+
+            # 2) ENGAGE target: 실제 ENGAGE였던 elite만 사용한다.
+            engage_valid = issued_valid & (
+                elite_actions[:, step_index, unit_index] == int(ActionType.ENGAGE)
+            )
+            if bool(engage_valid.any()):
+                target_counts = torch.bincount(
+                    elite_targets[engage_valid, step_index, unit_index],
+                    minlength=num_targets,
+                ).float()
+                empirical_target = _normalized_probability(target_counts)
+                target_probs[step_index, unit_index] = _normalized_probability(
+                    config.smoothing * distribution.target_probs[step_index, unit_index]
+                    + (1.0 - config.smoothing) * empirical_target
+                )
+
+            # 3) MOVE destination: 실제 MOVE였던 elite만 사용한다.
+            move_valid = issued_valid & (
+                elite_actions[:, step_index, unit_index] == int(ActionType.MOVE)
+            )
+            num_move = int(move_valid.sum().item())
+            if num_move > 0:
+                move_samples = elite_moves[
+                    move_valid,
+                    step_index,
+                    unit_index,
+                ]
+                empirical_mean = move_samples.mean(dim=0)
+                move_mean[step_index, unit_index] = _clip_move_xy(
+                    config.smoothing * distribution.move_mean[step_index, unit_index]
+                    + (1.0 - config.smoothing) * empirical_mean
+                )
+
+                # 한 점으로 std를 추정하면 0으로 붕괴하므로 2개 이상일 때만 갱신한다.
+                if num_move >= 2:
+                    empirical_std = torch.clamp(
+                        move_samples.std(dim=0, unbiased=False),
+                        min=config.min_move_std,
+                    )
+                    move_std[step_index, unit_index] = torch.clamp(
+                        config.smoothing * distribution.move_std[step_index, unit_index]
+                        + (1.0 - config.smoothing) * empirical_std,
+                        min=config.min_move_std,
+                    )
+
+            # 4) TURN angle: 실제 TURN이었던 elite만 사용한다.
+            turn_valid = issued_valid & (
+                elite_actions[:, step_index, unit_index] == int(ActionType.TURN)
+            )
+            num_turn = int(turn_valid.sum().item())
+            if num_turn > 0:
+                theta_samples = elite_theta[
+                    turn_valid,
+                    step_index,
+                    unit_index,
+                ]
+                theta_vector = torch.polar(
+                    torch.ones_like(theta_samples),
+                    theta_samples,
+                )
+                empirical_turn_mean = torch.angle(theta_vector.mean()).float()
+
+                # 평균 방향은 원형 공간에서 smoothing한다. ±pi 경계에서 선형 평균이
+                # 반대 방향으로 튀는 것을 막는다.
+                old_vector = torch.polar(
+                    torch.ones((), dtype=torch.float32, device=theta_samples.device),
+                    distribution.turn_mean[step_index, unit_index],
+                )
+                empirical_vector = torch.polar(
+                    torch.ones((), dtype=torch.float32, device=theta_samples.device),
+                    empirical_turn_mean,
+                )
+                blended_vector = (
+                    config.smoothing * old_vector
+                    + (1.0 - config.smoothing) * empirical_vector
+                )
+                turn_mean[step_index, unit_index] = torch.angle(blended_vector).float()
+
+                if num_turn >= 2:
+                    resultant = torch.abs(theta_vector.mean()).float()
+                    empirical_turn_std = torch.sqrt(
+                        torch.clamp(
+                            -2.0
+                            * torch.log(
+                                torch.clamp(resultant, min=1e-6, max=1.0)
+                            ),
+                            min=0.0,
+                        )
+                    )
+                    empirical_turn_std = torch.clamp(
+                        empirical_turn_std,
+                        min=config.min_turn_std,
+                    )
+                    turn_std[step_index, unit_index] = torch.clamp(
+                        config.smoothing * distribution.turn_std[step_index, unit_index]
+                        + (1.0 - config.smoothing) * empirical_turn_std,
+                        min=config.min_turn_std,
+                    )
+
+    return CEMDistribution(
+        action_probs=action_probs.float(),
+        move_mean=move_mean.float(),
+        move_std=move_std.float(),
+        turn_mean=_wrap_radians(turn_mean),
+        turn_std=turn_std.float(),
+        target_probs=target_probs.float(),
+    )
+
+
+def _denorm_x(x_norm: torch.Tensor) -> torch.Tensor:
+    """[-1, 1] x좌표를 DEVS 월드 x좌표로 되돌린다."""
+    return (x_norm + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN
+
+
+def _denorm_y(y_norm: torch.Tensor) -> torch.Tensor:
+    """[-1, 1] y좌표를 DEVS 월드 y좌표로 되돌린다."""
+    return (y_norm + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN
+
+
+def _mission_type_from_start(start_features: torch.Tensor, type_ids: torch.Tensor) -> int:
+    """현재 mission slot에서 임무 종류를 읽는다."""
+    mission = torch.nonzero(type_ids == int(ObjectType.MISSION), as_tuple=False).flatten()
+    if mission.shape != (1,):
+        raise ValueError(f"mission slot은 정확히 하나여야 한다: count={mission.numel()}")
+    value = int(round(float(start_features[int(mission[0].detach().cpu().item()), MISSION_TYPE_INDEX])))
+    if value not in MISSION_SCORE_SCALES:
+        raise ValueError(f"모르는 mission_type: {value}")
+    return value
+
+
+def _objective_xy_from_start(start_features: torch.Tensor, type_ids: torch.Tensor) -> torch.Tensor:
+    """현재 mission slot에서 objective 월드 좌표를 읽는다."""
+    mission = torch.nonzero(type_ids == int(ObjectType.MISSION), as_tuple=False).flatten()
+    if mission.shape != (1,):
+        raise ValueError(f"mission slot은 정확히 하나여야 한다: count={mission.numel()}")
+    mission_features = start_features[int(mission[0].detach().cpu().item())]
+    return torch.stack(
+        [
+            _denorm_x(mission_features[MISSION_OBJECTIVE_X_INDEX]),
+            _denorm_y(mission_features[MISSION_OBJECTIVE_Y_INDEX]),
+        ],
+        dim=0,
+    )
+
+
+def _objective_distance(
+    features: torch.Tensor,
+    *,
+    objective_xy: torch.Tensor,
+    blue_indices: torch.Tensor,
+) -> torch.Tensor:
+    """각 후보/frame에서 가장 가까운 생존 아군의 objective 거리를 계산한다."""
+    blue = features.index_select(-2, blue_indices)
+    alive = torch.clamp(blue[..., UNIT_ALIVE_INDEX], 0.0, 1.0) >= 0.5
+    x = _denorm_x(blue[..., UNIT_X_INDEX])
+    y = _denorm_y(blue[..., UNIT_Y_INDEX])
+    positions = torch.stack([x, y], dim=-1)
+    distances = torch.linalg.norm(positions - objective_xy.reshape(*((1,) * (positions.ndim - 1)), 2), dim=-1)
+    distances = torch.where(alive, distances, torch.full_like(distances, float("inf")))
+    min_distance = distances.min(dim=-1).values
+    return torch.where(
+        torch.isfinite(min_distance),
+        min_distance,
+        torch.full_like(min_distance, NO_ALIVE_BLUE_DISTANCE),
+    )
+
+
+def score_future_features_torch(
+    *,
+    current_batch: SlotBatch,
+    future_features: torch.Tensor,
+    weights: EvaluatorWeights = EvaluatorWeights(),
+) -> torch.Tensor:
+    """월드모델 future feature batch를 torch evaluator 점수로 변환한다."""
+    _expect_rank("future_features", future_features, 4)
+    _expect_finite("future_features", future_features)
+    device = future_features.device
+    start_features = _batch_tensor(current_batch, "features", device=device).float()
+    type_ids = _batch_tensor(current_batch, "type_ids", device=device).long()
+    team_ids = _batch_tensor(current_batch, "team_ids", device=device).long()
+    if future_features.shape[2] != start_features.shape[0]:
+        raise ValueError("future_features slot 수가 current_batch와 같아야 한다")
+    if future_features.shape[3] != MAX_FEATURE_DIM:
+        raise ValueError(f"future_features 마지막 차원은 {MAX_FEATURE_DIM}이어야 한다")
+
+    blue_indices = torch.nonzero((type_ids == int(ObjectType.UNIT)) & (team_ids == int(TeamId.BLUE)), as_tuple=False).flatten()
+    red_indices = torch.nonzero((type_ids == int(ObjectType.UNIT)) & (team_ids == int(TeamId.RED)), as_tuple=False).flatten()
+    if blue_indices.numel() == 0:
+        raise ValueError("BLUE unit slot이 하나도 없다")
+    if red_indices.numel() == 0:
+        raise ValueError("RED unit slot이 하나도 없다")
+
+    final_features = future_features[:, -1]
+    start_red_hp = torch.clamp(start_features.index_select(0, red_indices)[:, UNIT_HP_INDEX], 0.0, 1.0).sum()
+    final_red_hp = torch.clamp(final_features.index_select(1, red_indices)[..., UNIT_HP_INDEX], 0.0, 1.0).sum(dim=-1)
+    start_blue_hp = torch.clamp(start_features.index_select(0, blue_indices)[:, UNIT_HP_INDEX], 0.0, 1.0).sum()
+    final_blue_hp = torch.clamp(final_features.index_select(1, blue_indices)[..., UNIT_HP_INDEX], 0.0, 1.0).sum(dim=-1)
+    start_blue_ammo = torch.clamp(start_features.index_select(0, blue_indices)[:, UNIT_AMMO_INDEX], 0.0, 1.0).sum()
+    final_blue_ammo = torch.clamp(final_features.index_select(1, blue_indices)[..., UNIT_AMMO_INDEX], 0.0, 1.0).sum(dim=-1)
+
+    enemy_damage = torch.clamp(start_red_hp - final_red_hp, min=0.0)
+    blue_damage = torch.clamp(start_blue_hp - final_blue_hp, min=0.0)
+    ammo_used = torch.clamp(start_blue_ammo - final_blue_ammo, min=0.0) / float(blue_indices.numel())
+
+    start_red_hp_each = torch.clamp(start_features.index_select(0, red_indices)[:, UNIT_HP_INDEX], 0.0, 1.0)
+    start_red_alive_each = torch.clamp(start_features.index_select(0, red_indices)[:, UNIT_ALIVE_INDEX], 0.0, 1.0) >= 0.5
+    final_red_hp_each = torch.clamp(final_features.index_select(1, red_indices)[..., UNIT_HP_INDEX], 0.0, 1.0)
+    enemy_kia = ((start_red_hp_each.unsqueeze(0) > 0.01) & (final_red_hp_each <= 0.01)).float().sum(dim=-1)
+    future_red_hp = torch.clamp(future_features.index_select(2, red_indices)[..., UNIT_HP_INDEX], 0.0, 1.0)
+    future_red_alive = torch.clamp(future_features.index_select(2, red_indices)[..., UNIT_ALIVE_INDEX], 0.0, 1.0)
+    # 특정 표적 집중을 직접 보상하지 않고, 살아 있는 RED HP mass가 horizon 안에서
+    # 빨리 줄어드는 후보를 선호하게 만든다. KIA의 희소 신호를 보완하는 누적 보상이다.
+    start_red_hp_mass = (start_red_hp_each * start_red_alive_each.float()).sum()
+    future_red_hp_mass = (future_red_hp * (future_red_alive >= 0.5).float()).sum(dim=-1)
+    enemy_hp_mass_reduction = torch.clamp(start_red_hp_mass - future_red_hp_mass, min=0.0).mean(dim=-1)
+    # 총 피해량 보상은 분산 사격도 높게 평가한다. 낮은 HP 적을 더 낮게 만드는
+    # 연속 보상을 더해 HP 0 예측 전에도 마무리 사격 방향을 CEM이 볼 수 있게 한다.
+    start_finish_pressure = torch.square(1.0 - start_red_hp_each).unsqueeze(0)
+    final_finish_pressure = torch.square(1.0 - final_red_hp_each)
+    enemy_finish = torch.clamp(final_finish_pressure - start_finish_pressure, min=0.0).sum(dim=-1)
+    red_cleared_final = torch.all(final_red_hp_each <= 0.01, dim=-1)
+
+    objective_xy = _objective_xy_from_start(start_features, type_ids)
+    start_distance = _objective_distance(
+        start_features.reshape(1, start_features.shape[0], start_features.shape[1]),
+        objective_xy=objective_xy,
+        blue_indices=blue_indices,
+    )[0]
+    final_distance = _objective_distance(final_features, objective_xy=objective_xy, blue_indices=blue_indices)
+    max_progress = float(future_features.shape[1]) * BLUE_MAX_STEP_PER_SEC
+    objective_progress = (start_distance - final_distance) / max_progress
+    progress_weight = torch.where(
+        red_cleared_final,
+        torch.full_like(objective_progress, weights.objective_progress_cleared),
+        torch.full_like(objective_progress, weights.objective_progress),
+    )
+
+    mission_type = _mission_type_from_start(start_features, type_ids)
+    attack_scale, progress_scale, blue_loss_scale = MISSION_SCORE_SCALES[mission_type]
+
+    red_eliminated = torch.all((future_red_hp <= 0.01) | (future_red_alive < 0.5), dim=-1)
+    distances = _objective_distance(future_features, objective_xy=objective_xy, blue_indices=blue_indices)
+    objective_reached = distances <= OBJECTIVE_RADIUS
+    # 임무마다 "성공한 프레임"의 정의가 다르다. early_success는 그 프레임에
+    # 얼마나 빨리 도달했는지를 보상하므로 조건도 임무를 따라가야 한다.
+    if mission_type == MISSION_DESTROY_AND_REACH:
+        success = red_eliminated & objective_reached
+    elif mission_type == MISSION_DESTROY_ALL:
+        success = red_eliminated
+    elif mission_type == MISSION_REACH_OBJECTIVE:
+        success = objective_reached
+    else:
+        # 거점 방어는 "지금 점유 중인가"가 곧 성공 상태다. 빨리 붙을수록 좋다.
+        success = objective_reached
+    has_success = torch.any(success, dim=-1)
+    first_success = torch.argmax(success.float(), dim=-1)
+    early_success = torch.where(
+        has_success,
+        (float(future_features.shape[1]) - first_success.float()) / float(future_features.shape[1]),
+        torch.zeros_like(first_success, dtype=torch.float32),
+    )
+
+    attack_term = (
+        weights.enemy_damage * enemy_damage
+        + weights.enemy_hp_mass_reduction * enemy_hp_mass_reduction
+        + weights.enemy_kia * enemy_kia
+        + weights.enemy_finish * enemy_finish
+    )
+    return (
+        attack_scale * attack_term
+        - blue_loss_scale * weights.blue_damage * blue_damage
+        + progress_scale * progress_weight * objective_progress
+        + weights.early_success * early_success
+        - weights.ammo_used * ammo_used
+    ).float()
+
+
+def optimize_cem(
+    *,
+    current_batch: SlotBatch,
+    initial_distribution: CEMDistribution,
+    config: CEMConfig,
+    rollout_fn: Callable[[FutureActionPlanBatch], torch.Tensor],
+    score_fn: Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+) -> CEMResult:
+    """CEM으로 최고 점수의 future action plan을 찾는다."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(config.seed)
+    distribution = initial_distribution
+    best_score = -float("inf")
+    best_plan = sample_future_action_plans(
+        distribution=distribution,
+        current_batch=current_batch,
+        config=config,
+        generator=generator,
+        device=device,
+    ).take_candidates(torch.tensor([0], dtype=torch.long, device=device))
+    stats: list[CEMIterationStats] = []
+
+    for iteration in range(config.num_iterations):
+        plans = sample_future_action_plans(
+            distribution=distribution,
+            current_batch=current_batch,
+            config=config,
+            generator=generator,
+            device=device,
+        )
+        future_features = rollout_fn(plans)
+        _expect_rank("future_features", future_features, 4)
+        if future_features.shape[0] != config.num_candidates:
+            raise ValueError("rollout_fn이 반환한 candidate 수가 config.num_candidates와 같아야 한다")
+
+        scores = score_fn(future_features)
+        _expect_rank("scores", scores, 1)
+        _expect_finite("scores", scores)
+        if scores.shape != (config.num_candidates,):
+            raise ValueError("score_fn 반환 shape는 (num_candidates,)이어야 한다")
+
+        elite_scores, elite_indices = torch.topk(scores, k=config.num_elites, largest=True, sorted=True)
+        iteration_best_score = float(elite_scores[0].detach().cpu().item())
+        if iteration_best_score > best_score:
+            best_score = iteration_best_score
+            best_plan = plans.take_candidates(elite_indices[:1])
+
+        stats.append(
+            CEMIterationStats(
+                iteration=iteration,
+                best_score=iteration_best_score,
+                elite_mean=float(elite_scores.mean().detach().cpu().item()),
+                population_mean=float(scores.mean().detach().cpu().item()),
+            )
+        )
+        distribution = update_distribution(
+            distribution=distribution,
+            plans=plans,
+            elite_indices=elite_indices,
+            config=config,
+        )
+
+    if config.retarget_engage:
+        # 실제로 실행될 계획 하나만 교정한다. 후보 전체를 교정하면 rollout이 2배가
+        # 되는데(300x30이면 재계획당 18,000), 표적은 분포 갱신의 주 대상이 아니라
+        # 그만큼 얻는 게 없다. 여기서는 후보 1개짜리 rollout 한 번만 더 든다.
+        best_plan = retarget_engage_from_prediction(
+            plan=best_plan,
+            future_features=rollout_fn(best_plan),
+            current_batch=current_batch,
+            generator=generator,
+            device=device,
+        )
+
+    return CEMResult(
+        best_score=float(best_score),
+        best_plan=best_plan,
+        final_distribution=distribution,
+        iteration_stats=tuple(stats),
+    )
+
+
+def stack_slot_history(batches: tuple[SlotBatch, ...], *, device: torch.device) -> dict[str, torch.Tensor]:
+    """SlotBatch history를 월드모델 입력용 torch tensor로 쌓는다."""
+    if not batches:
+        raise ValueError("history SlotBatch가 비어 있다")
+    reference = batches[0]
+    for index, batch in enumerate(batches[1:], start=1):
+        if not torch.equal(torch.as_tensor(reference.type_ids), torch.as_tensor(batch.type_ids)):
+            raise ValueError(f"type_ids가 history frame {index}에서 변했다")
+        if not torch.equal(torch.as_tensor(reference.entity_ids), torch.as_tensor(batch.entity_ids)):
+            raise ValueError(f"entity_ids가 history frame {index}에서 변했다")
+        if not torch.equal(torch.as_tensor(reference.team_ids), torch.as_tensor(batch.team_ids)):
+            raise ValueError(f"team_ids가 history frame {index}에서 변했다")
+    return {
+        "features": torch.stack([_batch_tensor(batch, "features", device=device).float() for batch in batches], dim=0),
+        "feature_mask": torch.stack([_batch_tensor(batch, "feature_mask", device=device).bool() for batch in batches], dim=0),
+        "type_ids": torch.stack([_batch_tensor(batch, "type_ids", device=device).long() for batch in batches], dim=0),
+        "entity_ids": torch.stack([_batch_tensor(batch, "entity_ids", device=device).long() for batch in batches], dim=0),
+        "team_ids": torch.stack([_batch_tensor(batch, "team_ids", device=device).long() for batch in batches], dim=0),
+        "alive_mask": torch.stack([_batch_tensor(batch, "alive_mask", device=device).bool() for batch in batches], dim=0),
+    }
+
+
+def build_history_from_v2_run(run_dir: Path, *, end_time: float, history_frames: int) -> tuple[SlotBatch, ...]:
+    """v2 run 로그에서 끝 시점 기준 history SlotBatch를 읽는다."""
+    if history_frames <= 0:
+        raise ValueError("history_frames는 0보다 커야 한다")
+    start_time = float(end_time) - float(history_frames - 1)
+    if start_time < 0.0:
+        raise ValueError("history window 시작 시간이 0보다 작을 수 없다")
+    return tuple(build_slot_batch_from_v2_run(run_dir, start_time + float(offset)) for offset in range(history_frames))
+
+
+def combine_observed_and_future_actions(
+    *,
+    observed: ObservedActionWindow,
+    future: FutureActionPlanBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """관측 history action과 CEM 미래 action을 월드모델 입력 순서로 결합한다."""
+    candidates = future.action_features.shape[0]
+    observed_features = observed.action_features.unsqueeze(0).expand(candidates, *observed.action_features.shape)
+    observed_unit_ids = observed.action_unit_ids.unsqueeze(0).expand(candidates, *observed.action_unit_ids.shape)
+    observed_issued = observed.issued_mask.unsqueeze(0).expand(candidates, *observed.issued_mask.shape)
+    full_features = torch.cat([observed_features, future.action_features], dim=1).float()
+    full_unit_ids = torch.cat([observed_unit_ids, future.action_unit_ids], dim=1).long()
+    full_issued = torch.cat([observed_issued, future.issued_mask], dim=1).bool()
+    return full_features, full_unit_ids, full_issued
+
+
+def rollout_with_world_model(
+    *,
+    model: object,
+    history_batches: tuple[SlotBatch, ...],
+    observed_actions: ObservedActionWindow,
+    future_plans: FutureActionPlanBatch,
+    device: torch.device,
+    chunk_size: int = ROLLOUT_CHUNK_SIZE,
+) -> torch.Tensor:
+    """월드모델로 CEM 후보들의 future feature를 예측한다.
+
+    후보를 chunk_size씩 끊어 굴린다. attention이 후보 축까지 배치로 펼쳐지므로
+    한 번에 넣으면 후보 수에 비례해 메모리가 커진다 — 실측에서 후보 300개가
+    39.9GB를 쓰고 9.4GB를 더 요구하며 OOM이 났다(후보당 약 0.13GB).
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size는 0보다 커야 한다")
+    history = stack_slot_history(history_batches, device=device)
+    candidates = future_plans.action_features.shape[0]
+    action_features, action_unit_ids, issued_mask = combine_observed_and_future_actions(
+        observed=observed_actions,
+        future=future_plans,
+    )
+    action_features = action_features.to(device=device)
+    action_unit_ids = action_unit_ids.to(device=device)
+    issued_mask = issued_mask.to(device=device)
+
+    model.eval()
+    chunks: list[torch.Tensor] = []
+    with torch.no_grad():
+        for begin in range(0, candidates, chunk_size):
+            end = min(begin + chunk_size, candidates)
+            size = end - begin
+            output = model.rollout_cjepa_future(
+                history_features=history["features"].unsqueeze(0).expand(size, *history["features"].shape),
+                history_feature_mask=history["feature_mask"].unsqueeze(0).expand(size, *history["feature_mask"].shape),
+                history_type_ids=history["type_ids"].unsqueeze(0).expand(size, *history["type_ids"].shape),
+                history_entity_ids=history["entity_ids"].unsqueeze(0).expand(size, *history["entity_ids"].shape),
+                history_team_ids=history["team_ids"].unsqueeze(0).expand(size, *history["team_ids"].shape),
+                history_alive_mask=history["alive_mask"].unsqueeze(0).expand(size, *history["alive_mask"].shape),
+                action_features=action_features[begin:end],
+                action_unit_ids=action_unit_ids[begin:end],
+                issued_mask=issued_mask[begin:end],
+            )
+            # 반환 dict에는 history/action/future token도 들어 있어 feature보다 훨씬
+            # 크다. 참조를 끊지 않으면 다음 청크를 도는 동안 살아 있어 최대 사용량이
+            # 두 배가 된다.
+            chunks.append(output["future_features"].clone())
+            del output
+    return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+
+
+def _format_plan_line(plan: FutureActionPlanBatch, candidate_index: int, step_index: int) -> str:
+    """CLI 확인용으로 한 step joint action을 문자열화한다."""
+    parts: list[str] = []
+    for unit_index in range(plan.action_features.shape[2]):
+        unit_id = int(plan.action_unit_ids[candidate_index, step_index, unit_index].detach().cpu().item())
+        if not bool(plan.issued_mask[candidate_index, step_index, unit_index].detach().cpu().item()):
+            parts.append(f"B{unit_id}:NO_COMMAND")
+            continue
+        action_type = ActionType(int(plan.action_type_ids[candidate_index, step_index, unit_index].detach().cpu().item()))
+        if action_type == ActionType.MOVE:
+            x, y = plan.move_xy_norm[candidate_index, step_index, unit_index].detach().cpu().tolist()
+            parts.append(f"B{unit_id}:MOVE({x:.3f},{y:.3f})")
+        elif action_type == ActionType.ENGAGE:
+            target_id = int(plan.target_entity_ids[candidate_index, step_index, unit_index].detach().cpu().item())
+            parts.append(f"B{unit_id}:ENGAGE(R{target_id})")
+        elif action_type == ActionType.TURN:
+            theta = float(plan.theta_radians[candidate_index, step_index, unit_index].detach().cpu().item())
+            parts.append(f"B{unit_id}:TURN({theta:.3f})")
+        elif action_type == ActionType.STOP:
+            parts.append(f"B{unit_id}:STOP")
+        else:
+            raise ValueError(f"DEVS action vocabulary에 없는 action_type_id: {int(action_type)}")
+    return " | ".join(parts)
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    """현재 state에서 torch CEM 초기 후보를 샘플링해 확인한다."""
+    parser = argparse.ArgumentParser(description="Torch DEVS CEM future action sampler")
+    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--state-time", type=float, required=True)
+    parser.add_argument("--future-horizon", type=int, default=1)
+    parser.add_argument("--num-candidates", type=int, default=8)
+    parser.add_argument("--num-elites", type=int, default=2)
+    parser.add_argument("--num-iterations", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--limit", type=int, default=3)
+    parser.add_argument("--save-pt", type=Path)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    device = torch.device(args.device)
+    config = CEMConfig(
+        num_candidates=args.num_candidates,
+        num_elites=args.num_elites,
+        num_iterations=args.num_iterations,
+        future_horizon=args.future_horizon,
+        seed=args.seed,
+    )
+    current_batch = build_slot_batch_from_v2_run(args.run_dir, args.state_time)
+    distribution = build_initial_distribution(current_batch, config, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(config.seed)
+    plans = sample_future_action_plans(
+        distribution=distribution,
+        current_batch=current_batch,
+        config=config,
+        generator=generator,
+        device=device,
+    )
+
+    print(f"device={device}")
+    print(f"action_features_shape={tuple(plans.action_features.shape)}")
+    print(f"action_unit_ids={plans.action_unit_ids[0, 0].detach().cpu().tolist()}")
+    print(f"issued_mask={plans.issued_mask[0, 0].detach().cpu().tolist()}")
+    for candidate_index in range(min(args.limit, plans.action_features.shape[0])):
+        print(f"candidate={candidate_index}")
+        for step_index in range(plans.action_features.shape[1]):
+            print(f"  step={step_index}: {_format_plan_line(plans, candidate_index, step_index)}")
+
+    if args.save_pt is not None:
+        torch.save(
+            {
+                "action_features": plans.action_features.detach().cpu(),
+                "action_unit_ids": plans.action_unit_ids.detach().cpu(),
+                "issued_mask": plans.issued_mask.detach().cpu(),
+                "action_type_ids": plans.action_type_ids.detach().cpu(),
+                "target_entity_ids": plans.target_entity_ids.detach().cpu(),
+            },
+            args.save_pt,
+        )
+
+
+if __name__ == "__main__":
+    main()
