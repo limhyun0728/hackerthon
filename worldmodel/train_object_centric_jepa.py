@@ -524,10 +524,15 @@ def compute_training_losses(
         batch.features[:, :history_frames],
         batch.feature_mask[:, :history_frames],
     )
+    # 미래 상태 손실은 unit slot만 본다. 지형과 임무는 정지 물체라 미래가 이미
+    # 알려져 있고 예측 오차가 0에 가까운데, 평균에 들어가면 유닛 항의 gradient가
+    # N_unit / N_전체만큼 줄어든다. 실측 희석 배율이 맵과 팀 크기에 따라
+    # 4.8배(서울과기대 10v10)에서 57.2배(성수역 2v2)로 12배 범위를 널뛴다.
     future_state_loss = _masked_feature_mse(
         pred_features[:, future_slice],
         batch.features[:, future_slice],
-        batch.feature_mask[:, future_slice],
+        batch.feature_mask[:, future_slice]
+        & (batch.type_ids[:, future_slice] == int(ObjectType.UNIT)).unsqueeze(-1),
     )
     combat_state_loss = _combat_state_loss(
         pred_future=pred_features[:, future_slice],
