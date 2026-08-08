@@ -102,9 +102,16 @@ STICKINESS_RANGE = (0.3, 0.8)
 # 중앙 35m(유효사거리 70m 안)인데 RED 9명 중 균등 추출로 빗나간 표적을 골랐다.
 # 차단 시점 유효 표적은 평균 1.29명뿐이라 1/9 추출로는 약 14%만 맞는다.
 RETARGET_ENGAGE = os.environ.get("CEM_RETARGET_ENGAGE", "1") not in ("0", "false", "False")
-# 월드모델 rollout을 몇 후보씩 끊어 굴릴지. 후보당 약 0.13GB를 쓰므로 300개를 한 번에
-# 넣으면 40GB를 넘어 OOM이 난다. 환경변수로 GPU 여유에 맞춰 조정한다.
-ROLLOUT_CHUNK_SIZE = int(os.environ.get("CEM_ROLLOUT_CHUNK_SIZE", "32"))
+# 월드모델 rollout을 몇 후보씩 끊어 굴릴지.
+#
+# 사용량은 후보 수 x slot 수^2로 커진다(attention). slot 수는 유닛 수와 지형 장애물
+# 수에 따라 맵마다 크게 달라서, 작은 맵에서 잰 값을 큰 맵에 쓰면 터진다 — 6v6 강남역
+# 에서 청크 32가 18.3GB였는데, 같은 값 기준으로 96을 잡았더니 10v10 다중 맵에서
+# 한 번에 24.95GB를 요구하며 OOM이 났다.
+#
+# 16이 47GB GPU에서 10v10 + 장애물 많은 맵까지 안전한 값이다. 여유가 확인되면
+# 환경변수로 올린다.
+ROLLOUT_CHUNK_SIZE = int(os.environ.get("CEM_ROLLOUT_CHUNK_SIZE", "16"))
 NO_ALIVE_BLUE_DISTANCE = math.hypot(WORLD_X_MAX - WORLD_X_MIN, WORLD_Y_MAX - WORLD_Y_MIN)
 
 
@@ -1575,7 +1582,11 @@ def rollout_with_world_model(
                 action_unit_ids=action_unit_ids[begin:end],
                 issued_mask=issued_mask[begin:end],
             )
-            chunks.append(output["future_features"])
+            # 반환 dict에는 history/action/future token도 들어 있어 feature보다 훨씬
+            # 크다. 참조를 끊지 않으면 다음 청크를 도는 동안 살아 있어 최대 사용량이
+            # 두 배가 된다.
+            chunks.append(output["future_features"].clone())
+            del output
     return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
 

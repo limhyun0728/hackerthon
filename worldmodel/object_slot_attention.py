@@ -805,11 +805,29 @@ def cjepa_prediction_loss(
     masked_indices: torch.Tensor,
     history_frames: int,
     pred_frames: int,
+    type_ids: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """C-JEPA 학습 손실을 계산한다.
 
     DEVS slot은 entity id로 정렬되므로 Hungarian matching 없이 같은 index끼리
     비교한다. 손실은 숨겨진 history slot 복원과 future slot 예측을 분리해 낸다.
+
+    `type_ids`(B, N)를 주면 future 손실을 **unit slot으로 제한한다.** 지형과 임무는
+    정지 물체라 미래가 이미 알려져 있고, 예측 오차가 사실상 0이다. 그런데
+    `F.mse_loss`가 전체 원소 수로 나누므로 이들이 평균에 들어가면 유닛 항의 gradient가
+    `N_unit / N_전체`만큼 줄어든다. 실측 희석 배율:
+
+        서울과기대(장애물 76) 10v10   4.8배
+        성수역(장애물 224) 2v2       57.2배
+
+    단순히 작아지는 게 아니라 **에피소드마다 맵과 팀 크기가 바뀌어 12배 범위로
+    널뛴다.** 배치마다 유닛에 걸리는 실효 학습률이 달라진다는 뜻이다.
+
+    지표도 같은 이유로 망가진다. `loss_future`는 지형 비율에 좌우되어 유닛 예측
+    정확도를 나타내지 못한다. 검증 지표로 `loss_masked_history_state`가 잘 작동했던
+    (신호/잡음 7.1 대 1.3) 이유가 이것이다 — 그쪽은 masked_indices로 유닛만 본다.
+
+    하위 호환을 위해 `type_ids`가 없으면 이전처럼 전체 slot을 쓴다.
     """
     _expect_rank("pred_tokens", pred_tokens, 4)
     _expect_rank("target_tokens", target_tokens, 4)
@@ -827,10 +845,22 @@ def cjepa_prediction_loss(
     else:
         masked_history_loss = pred_tokens.new_zeros(())
 
-    future_loss = F.mse_loss(
-        pred_tokens[:, history_frames:history_frames + pred_frames],
-        target_tokens[:, history_frames:history_frames + pred_frames].detach(),
-    )
+    future_pred = pred_tokens[:, history_frames:history_frames + pred_frames]
+    future_target = target_tokens[:, history_frames:history_frames + pred_frames].detach()
+    if type_ids is not None:
+        _expect_rank("type_ids", type_ids, 2)
+        if type_ids.shape[0] != pred_tokens.shape[0] or type_ids.shape[1] != pred_tokens.shape[2]:
+            raise ValueError("type_ids shape는 (B, N)이어야 한다")
+        is_unit = (type_ids == int(ObjectType.UNIT)).reshape(
+            type_ids.shape[0], 1, type_ids.shape[1], 1
+        )
+        weight = is_unit.to(future_pred.dtype)
+        total = weight.sum() * future_pred.shape[1] * future_pred.shape[-1]
+        if float(total) <= 0.0:
+            raise ValueError("unit slot이 하나도 없어 future 손실을 낼 수 없다")
+        future_loss = (((future_pred - future_target) ** 2) * weight).sum() / total
+    else:
+        future_loss = F.mse_loss(future_pred, future_target)
     return {
         "loss_masked_history": masked_history_loss,
         "loss_future": future_loss,
@@ -1389,6 +1419,7 @@ class DEVSObjectCentricWorldModel(nn.Module):
             masked_indices=masked_indices,
             history_frames=self.config.history_frames,
             pred_frames=self.config.pred_frames,
+            type_ids=type_ids[:, 0],
         )
         pred_features = self.state_decoder(
             pred_tokens.reshape(pred_tokens.shape[0] * pred_tokens.shape[1], pred_tokens.shape[2], pred_tokens.shape[3]),
