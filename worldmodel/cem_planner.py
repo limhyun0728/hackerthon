@@ -474,16 +474,22 @@ def _sample_free_within(
     budget: torch.Tensor,
     free_tensor: torch.Tensor,
     generator: torch.Generator,
+    *,
+    mean: torch.Tensor,
+    std: torch.Tensor,
 ) -> torch.Tensor:
-    """anchor에서 budget 안에 드는 자유공간 점을 균등 추출한다.
+    """anchor에서 budget 안 자유공간 점을 CEM 목적지 분포로 가중해 뽑는다.
 
     자유공간 점을 뽑은 뒤 거리로 자르면 안 된다 — 잘린 지점이 건물 안에 떨어진다.
-    예산 안에 드는 점만 남기고 그중에서 균등하게 고른다.
+    예산 안에 드는 점만 남기고 그중에서 고른다.
 
-    한때 목적(목표 지점/최근접 적/무작위)을 후보마다 정하고 exp(-거리/tau)로 그쪽에
-    가중을 줬으나 제거했다. 목적지를 어디로 향하게 할지는 전술 판단이고, 그걸 제안
-    분포에 손으로 넣으면 CEM이 무작위 계획을 뽑아 채점으로 고른다는 구조가 무너진다.
-    접근을 유도해야 한다면 채점 쪽에서 풀어야 한다.
+    가중은 `update_distribution`이 엘리트 목적지로 갱신한 `move_mean`/`move_std`의
+    가우시안이다. 이걸 안 쓰고 균등 추출만 하면 **CEM 반복이 이동을 학습하지 못한다**
+    — 액션 종류와 표적은 반복마다 좁혀지는데 목적지만 매번 처음부터 무작위가 되고,
+    실측에서 목표에 가까워진 걸음이 33.4%로 무작위(50%)보다도 낮았다.
+
+    목적(목표 지점/최근접 적)을 손으로 지정하는 것과는 다르다. 그쪽은 사람이 넣은
+    전술 판단이라 제거했고, 이건 CEM이 스스로 높게 채점한 쪽으로 좁히는 본래 동작이다.
     """
     flat_anchor = anchor.reshape(-1, 2)
     distance = torch.cdist(flat_anchor.unsqueeze(0), free_tensor.unsqueeze(0)).squeeze(0)
@@ -492,13 +498,22 @@ def _sample_free_within(
     nearest = distance.argmin(dim=1, keepdim=True)
     within.scatter_(1, nearest, True)
 
-    picked = torch.multinomial(within.float(), 1, generator=generator).squeeze(1)
+    # 축마다 std가 다르므로 축별로 표준화한 제곱거리를 쓴다.
+    delta = free_tensor.unsqueeze(0) - mean.reshape(-1, 1, 2)
+    scaled = delta / std.reshape(-1, 1, 2).clamp_min(1e-3)
+    logits = -0.5 * (scaled * scaled).sum(dim=-1)
+    logits = logits.masked_fill(~within, -float("inf"))
+    # 예산 안 점들이 전부 평균에서 멀면 logits가 모두 -inf에 가까워 softmax가 NaN이
+    # 될 수 있다. 행마다 최대값을 빼서 수치적으로 안정화한다.
+    logits = logits - logits.max(dim=1, keepdim=True).values
+    picked = torch.multinomial(torch.softmax(logits, dim=1), 1, generator=generator).squeeze(1)
     return free_tensor.index_select(0, picked).reshape(anchor.shape)
 
 
 def _sample_reachable_move_targets(
     *,
     current_batch: SlotBatch,
+    distribution: CEMDistribution,
     blue_indices: torch.Tensor,
     action_type_ids: torch.Tensor,
     issued_mask: torch.Tensor,
@@ -540,6 +555,24 @@ def _sample_reachable_move_targets(
     candidates, horizon, num_units = action_type_ids.shape
     free_tensor = torch.as_tensor(free, device=device)
 
+    # CEM 목적지 분포를 월드 좌표로 옮긴다. 정규좌표 [-1,1]이 월드 폭에 대응하므로
+    # std도 같은 배율로 늘린다.
+    span = torch.tensor(
+        [0.5 * (WORLD_X_MAX - WORLD_X_MIN), 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN)],
+        dtype=torch.float32,
+        device=device,
+    )
+    origin = torch.tensor(
+        [
+            0.5 * (WORLD_X_MAX + WORLD_X_MIN),
+            0.5 * (WORLD_Y_MAX + WORLD_Y_MIN),
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    move_mean_world = distribution.move_mean.to(device=device) * span + origin   # (H, U, 2)
+    move_std_world = distribution.move_std.to(device=device) * span             # (H, U, 2)
+
     is_move = (action_type_ids == int(ActionType.MOVE)) & issued_mask
 
     # 각 스텝에서 시작하는 연속 MOVE 구간의 길이. 뒤에서부터 누적한다.
@@ -560,7 +593,15 @@ def _sample_reachable_move_targets(
 
     for step in range(horizon):
         budget = run_length[:, step] * MAX_MOVE_PER_STEP
-        sampled = _sample_free_within(anchor, budget, free_tensor, generator)
+        sampled = _sample_free_within(
+            anchor,
+            budget,
+            free_tensor,
+            generator,
+            # 분포는 (H, U, 2)이고 anchor는 (후보, U, 2)라 후보 축으로 펼친다.
+            mean=move_mean_world[step].unsqueeze(0).expand(candidates, num_units, 2),
+            std=move_std_world[step].unsqueeze(0).expand(candidates, num_units, 2),
+        )
         begin = run_start[:, step].unsqueeze(-1)
         current_target = torch.where(begin, sampled, current_target)
         targets[:, step] = current_target
@@ -645,14 +686,17 @@ def build_initial_distribution(current_batch: SlotBatch, config: CEMConfig, *, d
     prior = _normalized_probability(torch.tensor(config.action_prior, dtype=torch.float32, device=device))
     action_probs = prior.reshape(1, 1, ACTION_TYPE_COUNT).expand(horizon, num_blue, ACTION_TYPE_COUNT).clone()
 
-    mission_index = _mission_index(current_batch, device=device)
-    objective_xy = features[mission_index, [MISSION_OBJECTIVE_X_INDEX, MISSION_OBJECTIVE_Y_INDEX]]
+    # 초기 목적지 분포는 현재 위치 중심에 initial_move_std로 넓게 둔다. 이 std는
+    # 정규좌표 0.45(월드 9유닛)이고 6스텝 이동 예산도 9유닛이라, 첫 iteration은
+    # 예산 안 자유공간에서 사실상 균등 추출이 된다. 이후 iteration부터 엘리트가 좁힌다.
+    #
+    # 전에는 목표 지점까지 직선 보간을 초기 평균으로 썼다. move_mean이 실제로
+    # 샘플링에 쓰이게 된 지금 그대로 두면 "목표로 가라"는 전술 판단을 제안 분포에
+    # 다시 넣는 셈이라 현재 위치로 바꿨다.
     current_xy = features.index_select(0, blue_indices)[:, [UNIT_X_INDEX, UNIT_Y_INDEX]]
-    move_mean = torch.zeros((horizon, num_blue, 2), dtype=torch.float32, device=device)
-    for step_index in range(horizon):
-        alpha = float(step_index + 1) / float(horizon)
-        move_mean[step_index] = current_xy + alpha * (objective_xy.reshape(1, 2) - current_xy)
-    move_mean = _clip_move_xy(move_mean)
+    move_mean = _clip_move_xy(
+        current_xy.reshape(1, num_blue, 2).expand(horizon, num_blue, 2).clone()
+    )
     move_std = torch.full((horizon, num_blue, 2), config.initial_move_std, dtype=torch.float32, device=device)
 
     turn_mean = torch.zeros((horizon, num_blue), dtype=torch.float32, device=device)
@@ -734,6 +778,7 @@ def sample_future_action_plans(
     # 뒤라야 유닛별 이동 예산(누적 MOVE 횟수)을 알 수 있어 여기에 둔다.
     reachable = _sample_reachable_move_targets(
         current_batch=current_batch,
+        distribution=distribution,
         blue_indices=blue_indices,
         action_type_ids=action_type_ids,
         issued_mask=issued_mask,
