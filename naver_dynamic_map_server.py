@@ -213,17 +213,12 @@ HTML = r"""<!doctype html>
       display: none;
     }
     .objective-marker {
-      width: 34px;
-      height: 34px;
-      border-radius: 50%;
-      display: grid;
-      place-items: center;
-      border: 2px solid #4c1d95;
-      background: #7c3aed;
-      color: #ffffff;
-      font-size: 10px;
-      font-weight: 800;
-      box-shadow: 0 5px 12px rgba(15, 23, 42, 0.25);
+      /* 별 하나로 둔다. 알약에 텍스트를 넣으면 시각적 무게가 커서 유닛을 가린다. */
+      color: #a855f7;
+      font-size: 30px;
+      line-height: 30px;
+      text-shadow: 0 0 4px #000, 0 0 8px #000;
+      pointer-events: none;
     }
     @media (max-width: 560px) {
       .bar {
@@ -269,6 +264,10 @@ HTML = r"""<!doctype html>
       currentTime: 0,
       markers: new Map(),
       fovs: new Map(),
+      showFov: false,
+      showBelief: false,
+      observedNow: new Set(),
+      lastSeen: new Map(),
       rings: new Map(),
       unitBodies: new Map(),
       trails: new Map(),
@@ -288,6 +287,8 @@ HTML = r"""<!doctype html>
 
     async function boot() {
       const config = await fetch("/api/config").then((res) => res.json());
+      app.showFov = Boolean(config.showFov);
+      app.showBelief = Boolean(config.showBelief);
       app.config = config;
       if (!config.clientId) {
         showMessage("NAVER_MAP_CLIENT_ID 또는 --client-id 값을 넣어야 네이버 Dynamic Map이 로드됩니다.");
@@ -389,7 +390,7 @@ HTML = r"""<!doctype html>
           map: app.map,
           position: xyToLatLng(app.data.objective[0], app.data.objective[1]),
           icon: {
-            content: '<div class="objective-marker">OBJ</div>',
+            content: '<div class="objective-marker">&#9733;</div>',
             anchor: new naver.maps.Point(17, 17)
           }
         });
@@ -432,13 +433,98 @@ HTML = r"""<!doctype html>
       app.obstaclePolygons.push(polygon);
     }
 
-    function markerHtml(unitId, state) {
+    // 지휘관 플랫폼과 같은 표현을 쓴다. 점은 실축척(0.7m), 라벨과 HP바는 옆에
+    // 붙여 화면 고정 크기로 읽는다. zoom19까지는 실축척이 하한보다 작아 하한이
+    // 곧 표시 크기가 된다.
+    const MIN_UNIT_PX = 7;
+    const MIN_BELIEVED_PX = 11;
+    const RED_MAX_SPEED_MPS = 10.0;
+    const PERCEPTION_RANGE_M = 100.0;
+
+    function metersPerPixel() {
+      const lat = app.config.originLat || 37.5;
+      return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, app.map.getZoom());
+    }
+
+    function markerHtml(unitId, state, believed, staleSec) {
       const blue = Number(unitId) < 200;
-      const dead = Number(state.hp) <= 0;
-      const cls = ["unit-marker", blue ? "blue" : "red", dead ? "dead" : ""].join(" ");
-      const prefix = blue ? "B" : "R";
-      const hpText = Number.isFinite(Number(state.hp)) ? `<span class="hp">${Math.round(Number(state.hp))}</span>` : "";
-      return `<div class="${cls}">${prefix}${unitId}${hpText}</div>`;
+      const alive = Number(state.hp) > 0;
+      const bg = !alive ? "#484f58" : (blue ? "#1f6feb" : (believed ? "#fb8500" : "#da3633"));
+      const ratio = Math.max(0, Math.min(1, Number(state.hp) / 100));
+      const base = Math.max(MIN_UNIT_PX, (app.config.unitRadiusMeters * 2) / metersPerPixel());
+      const dot = believed ? Math.max(base, MIN_BELIEVED_PX) : base;
+      // 불확실 반경 = RED 최대속도 x 미관측 경과. 관측거리에서 자른다.
+      const radiusM = Math.min(PERCEPTION_RANGE_M, (staleSec || 0) * RED_MAX_SPEED_MPS);
+      const halo = believed ? Math.max(16, 2 * radiusM / metersPerPixel()) : 0;
+      const haloHtml = halo
+        ? `<div style="position:absolute;left:${-halo / 2}px;top:${-halo / 2}px;width:${halo}px;height:${halo}px;
+             border-radius:50%;border:2px dashed #fb8500;background:radial-gradient(circle,#fb850040 0%,#fb850018 60%,#fb850000 100%)"></div>`
+        : "";
+      const shadow = believed
+        ? "0 0 0 2px #ffe0b2,0 0 10px 3px #fb8500cc"
+        : "0 0 0 1px #ffffffcc";
+      const label = `${blue ? "B" : "R"}${Number(unitId) % 100}${believed ? ` ?${Math.round(staleSec)}s` : ""}`;
+      const hpBar = alive
+        ? `<div style="position:absolute;left:${dot / 2 + 5}px;top:8px;width:40px;height:6px;
+             background:#000000cc;border-radius:3px;box-shadow:0 0 3px #000">
+             <div style="width:${Math.round(ratio * 100)}%;height:100%;border-radius:3px;
+               background:${ratio > 0.6 ? "#3fb950" : ratio > 0.3 ? "#d29922" : "#f85149"}"></div></div>`
+        : "";
+      return `<div style="position:relative;width:0;height:0">${haloHtml}
+        <div style="position:absolute;left:${-dot / 2}px;top:${-dot / 2}px;width:${dot}px;height:${dot}px;
+          border-radius:50%;background:${bg};box-shadow:${shadow}"></div>
+        <div style="position:absolute;left:${dot / 2 + 5}px;top:-11px;white-space:nowrap;
+          font:600 15px/17px system-ui;color:${believed ? "#fb8500" : "#fff"};
+          text-shadow:0 0 4px #000,0 0 4px #000,0 0 4px #000">${label}</div>
+        ${hpBar}</div>`;
+    }
+
+    // 사거리 안이고 시선이 트인 RED만 "관측"으로 본다. LosWorldAtomic의 피해
+    // 판정과 같은 규칙이라, 쏠 수 있으면 빨강이고 아니면 주황이 된다.
+    const MAX_FIRE_RANGE_UNITS = 10.0;
+
+    function segmentBlocked(ax, ay, bx, by) {
+      for (const rect of app.data.obstacles || []) {
+        const [x0, y0, x1, y1] = rect;
+        const dx = bx - ax;
+        const dy = by - ay;
+        let tMin = 0;
+        let tMax = 1;
+        let hit = true;
+        for (const [pos, delta, low, high] of [[ax, dx, x0, x1], [ay, dy, y0, y1]]) {
+          if (Math.abs(delta) < 1e-12) {
+            if (pos < low || pos > high) { hit = false; break; }
+            continue;
+          }
+          let t0 = (low - pos) / delta;
+          let t1 = (high - pos) / delta;
+          if (t0 > t1) { const tmp = t0; t0 = t1; t1 = tmp; }
+          tMin = Math.max(tMin, t0);
+          tMax = Math.min(tMax, t1);
+          if (tMin > tMax) { hit = false; break; }
+        }
+        if (hit) return true;
+      }
+      return false;
+    }
+
+    function observedRedIds(states) {
+      const blue = [];
+      const seen = new Set();
+      for (const [id, st] of states.entries()) {
+        if (Number(id) < 200 && Number(st.hp) > 0) blue.push(st);
+      }
+      for (const [id, st] of states.entries()) {
+        if (Number(id) < 200 || Number(st.hp) <= 0) continue;
+        for (const b of blue) {
+          const d = Math.hypot(st.x - b.x, st.y - b.y);
+          if (d <= MAX_FIRE_RANGE_UNITS && !segmentBlocked(b.x, b.y, st.x, st.y)) {
+            seen.add(String(id));
+            break;
+          }
+        }
+      }
+      return seen;
     }
 
     function stateAt(series, timeSec) {
@@ -591,6 +677,7 @@ HTML = r"""<!doctype html>
         if (!state) continue;
         states.set(unitId, state);
       }
+      app.observedNow = observedRedIds(states);
       for (const [unitId, state] of states.entries()) {
         ensureUnitOverlays(unitId, state);
         const dead = Number(state.hp) <= 0;
@@ -602,8 +689,20 @@ HTML = r"""<!doctype html>
         body.setRadius(app.config.unitRadiusMeters);
         body.setVisible(!dead);
         app.markers.get(unitId).setPosition(position);
-        app.markers.get(unitId).setIcon({ content: markerHtml(unitId, state), anchor: new naver.maps.Point(18, 30) });
-        app.fovs.get(unitId).setPaths(dead ? [] : sectorPath(state, 10, 60));
+        const isRed = Number(unitId) >= 200;
+        const believed = app.showBelief && isRed && !dead && !app.observedNow.has(String(unitId));
+        if (isRed && !believed) app.lastSeen.set(String(unitId), app.currentTime);
+        const stale = believed
+          ? Math.max(0, app.currentTime - (app.lastSeen.get(String(unitId)) ?? 0))
+          : 0;
+        app.markers.get(unitId).setIcon({
+          content: markerHtml(unitId, state, believed, stale),
+          anchor: new naver.maps.Point(0, 0)
+        });
+        // 시야각 부채꼴은 그리지 않는다. LosWorldAtomic이 피해 판정에 시야각을
+        // 쓰지 않으므로 화면에만 있는 정보이고, 유닛이 겹치면 지형을 가린다.
+        // NAVER_MAP_SHOW_FOV=1 로 다시 켤 수 있다.
+        app.fovs.get(unitId).setPaths((dead || !app.showFov) ? [] : sectorPath(state, 10, 60));
         app.trails.get(unitId).setPath(trailPath(app.data.units[unitId], app.currentTime, state));
         const ring = app.rings.get(unitId);
         if (ring) {
@@ -891,6 +990,13 @@ def _make_handler(args: argparse.Namespace):
                         "unitRadiusUnits": unit_radius_units,
                         "unitRadiusMeters": unit_radius_meters,
                         "zoom": args.zoom,
+                        # 시야각 부채꼴 표시 여부. LosWorldAtomic이 피해 판정에
+                        # 시야각을 쓰지 않으므로 기본은 끈다.
+                        "showFov": os.getenv("NAVER_MAP_SHOW_FOV", "0") not in ("0", "", "false"),
+                        # 미관측 RED를 주황 + 불확실 원으로 그릴지. 플랫폼은 안개
+                        # 상황에서 지휘결심을 돕는 것이라 켜지만, 비교용 영상은
+                        # 실제 DEVS 결과를 그대로 보여야 하므로 기본은 끈다.
+                        "showBelief": os.getenv("NAVER_MAP_SHOW_BELIEF", "0") not in ("0", "", "false"),
                         "runDir": str(run_dir),
                     },
                 )

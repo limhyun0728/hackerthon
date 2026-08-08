@@ -22,6 +22,7 @@ import torch
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from hackerthon.combat_config import MAX_FIRE_RANGE
 from hackerthon.terrain import (
     WORLD_X_MAX,
     WORLD_X_MIN,
@@ -86,15 +87,27 @@ DEFAULT_ACTION_PRIOR = (0.20, 0.50, 0.25, 0.05)
 CANDIDATE_MIX_ALPHA = (0.25, 0.45, 0.28, 0.02)
 # 직전 액션을 그대로 이어갈 확률 범위. 후보마다 뽑아 구간 길이를 다양하게 만든다.
 STICKINESS_RANGE = (0.3, 0.8)
-# 후보가 향할 목적. 이 비율로 뽑는다. 자유공간 균등 추출만 쓰면 방향이 매 구간
-# 바뀌어 유닛이 제자리를 맴돈다 — 실측에서 목표까지 17.9유닛을 60초 동안 거의
-# 못 좁혔다(규칙 정책은 5.0까지 접근). 후보마다 목적을 하나 정해 그쪽으로 가중한다.
-GOAL_WEIGHTS = (0.45, 0.35, 0.20)   # 목표 지점 / 최근접 적 / 무작위 자유점
-# 목적 지향 강도. 작을수록 직진, 클수록 탐색. 후보마다 뽑아 둘 다 나오게 한다.
-GOAL_TEMPERATURE_RANGE = (0.5, 6.0)
-# 0이면 목적 가중을 끄고 예산 안 자유공간에서 균등 추출한다(이전 동작).
-# 같은 코드로 켠 실험과 끈 실험을 나란히 돌리기 위한 스위치다.
-GOAL_DIRECTED = os.environ.get("CEM_GOAL_DIRECTED", "1") not in ("0", "false", "False")
+# MOVE 목적지는 예산 안 자유공간에서 균등 추출한다. 한때 후보마다 목적(목표 지점 /
+# 최근접 적 / 무작위 자유점)을 정하고 그쪽으로 가중했으나 제거했다 — 어디로 향할지는
+# 전술 판단이고, 제안 분포에 손으로 넣으면 "무작위 계획을 뽑아 채점으로 고른다"는
+# 구조가 무너진다. 접근이 필요하면 채점 쪽에서 풀어야 한다.
+#
+# 제거 시점의 실측(seed 5555, 30 에피소드): 목적 지향을 켜면 적과의 거리가 71->63m로
+# 좁혀지고 끄면 68->85m로 벌어졌다(규칙 정책 75->54m). 즉 이 제거는 접근 성능을
+# 내주고 구조를 지키는 선택이며, 그 손실은 채점에서 회복해야 한다.
+# ENGAGE 표적을 그 스텝의 예측 상태로 다시 뽑는다. 끄면 이전 동작(전 스텝 균등 추출).
+#
+# 계획을 현재 상태만 보고 6스텝 한 번에 뽑으면, step k의 표적을 step k에 실제로 쏠 수
+# 있는 적 중에서 고를 방법이 없다. 현재 상태를 아는 스텝은 step 0뿐이고 거기에만
+# hard mask가 걸린다. 그래서 실측에서 step 0은 ENGAGE 실행률 100%인데 step 5는 3.6%다.
+#
+# 차단된 ENGAGE 108건을 분해하면 59.3%는 접근 문제가 아니었다 — 가장 가까운 생존 적이
+# 중앙 35m(유효사거리 70m 안)인데 RED 9명 중 균등 추출로 빗나간 표적을 골랐다.
+# 차단 시점 유효 표적은 평균 1.29명뿐이라 1/9 추출로는 약 14%만 맞는다.
+RETARGET_ENGAGE = os.environ.get("CEM_RETARGET_ENGAGE", "1") not in ("0", "false", "False")
+# 월드모델 rollout을 몇 후보씩 끊어 굴릴지. 후보당 약 0.13GB를 쓰므로 300개를 한 번에
+# 넣으면 40GB를 넘어 OOM이 난다. 환경변수로 GPU 여유에 맞춰 조정한다.
+ROLLOUT_CHUNK_SIZE = int(os.environ.get("CEM_ROLLOUT_CHUNK_SIZE", "32"))
 NO_ALIVE_BLUE_DISTANCE = math.hypot(WORLD_X_MAX - WORLD_X_MIN, WORLD_Y_MAX - WORLD_Y_MIN)
 
 
@@ -114,6 +127,9 @@ class CEMConfig:
     min_turn_std: float = 0.05
     min_action_probability: float = 0.02
     action_prior: tuple[float, float, float, float] = DEFAULT_ACTION_PRIOR
+    # 마지막 iteration에서 step 1~ ENGAGE 표적을 그 스텝의 예측 상태로 다시 뽑는다.
+    # 그 iteration만 rollout이 2배가 된다.
+    retarget_engage: bool = RETARGET_ENGAGE
 
     def __post_init__(self) -> None:
         """CEM 설정값을 즉시 검증한다."""
@@ -458,20 +474,17 @@ def _sample_free_within(
     budget: torch.Tensor,
     free_tensor: torch.Tensor,
     generator: torch.Generator,
-    *,
-    goal: torch.Tensor,
-    temperature: torch.Tensor,
 ) -> torch.Tensor:
-    """anchor에서 budget 안 자유공간 점을 목적 쪽으로 가중해 뽑는다.
+    """anchor에서 budget 안에 드는 자유공간 점을 균등 추출한다.
 
     자유공간 점을 뽑은 뒤 거리로 자르면 안 된다 — 잘린 지점이 건물 안에 떨어진다.
-    거리순으로 정렬해 두고 예산 안에 드는 앞쪽 구간에서만 고른다.
+    예산 안에 드는 점만 남기고 그중에서 균등하게 고른다.
 
-    그 구간에서 균등하게 뽑으면 방향이 매번 바뀌어 유닛이 제자리를 맴돈다. 목적까지
-    거리에 exp(-d / tau) 가중을 준다. tau가 작으면 직진, 크면 탐색이라 후보마다
-    성격이 갈린다.
+    한때 목적(목표 지점/최근접 적/무작위)을 후보마다 정하고 exp(-거리/tau)로 그쪽에
+    가중을 줬으나 제거했다. 목적지를 어디로 향하게 할지는 전술 판단이고, 그걸 제안
+    분포에 손으로 넣으면 CEM이 무작위 계획을 뽑아 채점으로 고른다는 구조가 무너진다.
+    접근을 유도해야 한다면 채점 쪽에서 풀어야 한다.
     """
-    device = free_tensor.device
     flat_anchor = anchor.reshape(-1, 2)
     distance = torch.cdist(flat_anchor.unsqueeze(0), free_tensor.unsqueeze(0)).squeeze(0)
     within = distance <= budget.reshape(-1, 1)
@@ -479,12 +492,7 @@ def _sample_free_within(
     nearest = distance.argmin(dim=1, keepdim=True)
     within.scatter_(1, nearest, True)
 
-    to_goal = torch.cdist(goal.reshape(-1, 2).unsqueeze(0), free_tensor.unsqueeze(0)).squeeze(0)
-    tau = temperature.reshape(-1, 1)
-    logits = (-to_goal / tau.clamp_min(1e-3)) if GOAL_DIRECTED else torch.zeros_like(to_goal)
-    logits = logits.masked_fill(~within, -float("inf"))
-    weight = torch.softmax(logits, dim=1)
-    picked = torch.multinomial(weight, 1, generator=generator).squeeze(1)
+    picked = torch.multinomial(within.float(), 1, generator=generator).squeeze(1)
     return free_tensor.index_select(0, picked).reshape(anchor.shape)
 
 
@@ -532,41 +540,6 @@ def _sample_reachable_move_targets(
     candidates, horizon, num_units = action_type_ids.shape
     free_tensor = torch.as_tensor(free, device=device)
 
-    # 후보마다 목적 하나와 지향 강도를 뽑는다. 같은 후보 안에서는 방향이 일관되고
-    # 후보 사이에서는 갈린다. 6스텝 커밋이 그래야 "한 목적을 향해 나아가는 6초"가
-    # 되고, 무작위 방향으로 6초를 밀어붙이는 일이 없어진다.
-    features_all = torch.as_tensor(current_batch.features, device=device).float()
-    type_ids_all = torch.as_tensor(current_batch.type_ids, device=device).long()
-    mission_index = int(torch.argmax((type_ids_all == int(ObjectType.MISSION)).long()).item())
-    objective_xy = torch.stack(
-        [
-            (features_all[mission_index, MISSION_OBJECTIVE_X_INDEX] + 1.0) * 0.5
-            * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
-            (features_all[mission_index, MISSION_OBJECTIVE_Y_INDEX] + 1.0) * 0.5
-            * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
-        ]
-    )
-    _, red_xy_norm = red_target_table(current_batch, device=device)
-    if red_xy_norm.numel() > 0:
-        red_xy = torch.stack(
-            [
-                (red_xy_norm[:, 0] + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
-                (red_xy_norm[:, 1] + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
-            ],
-            dim=-1,
-        )
-    else:
-        red_xy = objective_xy.reshape(1, 2)
-
-    goal_probs = torch.tensor(GOAL_WEIGHTS, dtype=torch.float32, device=device)
-    goal_kind = torch.multinomial(
-        goal_probs.expand(candidates, len(GOAL_WEIGHTS)), 1, generator=generator
-    ).squeeze(-1)
-    low, high = GOAL_TEMPERATURE_RANGE
-    temperature = low + (high - low) * torch.rand(
-        (candidates,), generator=generator, device=device
-    )
-
     is_move = (action_type_ids == int(ActionType.MOVE)) & issued_mask
 
     # 각 스텝에서 시작하는 연속 MOVE 구간의 길이. 뒤에서부터 누적한다.
@@ -585,33 +558,9 @@ def _sample_reachable_move_targets(
     current_target = anchor.clone()
     targets = torch.zeros((candidates, horizon, num_units, 2), dtype=torch.float32, device=device)
 
-    # 유닛별 목적 좌표. 무작위 목적(kind 2)은 자유공간에서 뽑아 유닛마다 다르게 둔다.
-    goal = objective_xy.reshape(1, 1, 2).expand(candidates, num_units, 2).clone()
-    nearest = red_xy[
-        torch.cdist(start.unsqueeze(0), red_xy.unsqueeze(0)).squeeze(0).argmin(dim=1)
-    ]
-    goal[goal_kind == 1] = nearest.reshape(1, num_units, 2).expand(candidates, num_units, 2)[
-        goal_kind == 1
-    ]
-    scatter = free_tensor.index_select(
-        0,
-        torch.randint(
-            0, free_tensor.shape[0], (candidates * num_units,), generator=generator, device=device
-        ),
-    ).reshape(candidates, num_units, 2)
-    goal[goal_kind == 2] = scatter[goal_kind == 2]
-
     for step in range(horizon):
         budget = run_length[:, step] * MAX_MOVE_PER_STEP
-        sampled = _sample_free_within(
-            anchor,
-            budget,
-            free_tensor,
-            generator,
-            goal=goal,
-            # 온도는 후보 단위이고 anchor는 (후보 x 유닛)이라 유닛 축으로 펼친다.
-            temperature=temperature.reshape(-1, 1).expand(candidates, num_units),
-        )
+        sampled = _sample_free_within(anchor, budget, free_tensor, generator)
         begin = run_start[:, step].unsqueeze(-1)
         current_target = torch.where(begin, sampled, current_target)
         targets[:, step] = current_target
@@ -827,6 +776,117 @@ def sample_future_action_plans(
         move_xy_norm=move_xy_norm,
         theta_radians=theta_radians,
         red_target_ids=red_ids,
+    )
+
+
+def retarget_engage_from_prediction(
+    *,
+    plan: FutureActionPlanBatch,
+    future_features: torch.Tensor,
+    current_batch: SlotBatch,
+    generator: torch.Generator,
+    device: torch.device,
+) -> FutureActionPlanBatch:
+    """step k의 ENGAGE 표적을 step k 예측 상태에서 다시 뽑는다.
+
+    한 번 rollout해서 각 스텝의 예측 상태를 얻은 뒤, **그 시점에 사거리 안에 있는
+    적 중에서 균등하게** 표적을 다시 뽑는다. 계획을 채점 후에 손보는 게 아니라
+    **채점 전에** 제안을 다듬는 것이라, 최종적으로 채점되는 계획과 실행되는 계획은
+    그대로 일치한다.
+
+    사거리 안에 아무도 없으면 원래 표적을 그대로 둔다. 여기서 액션 종류를 바꾸면
+    계획의 액션 분포가 달라지므로 건드리지 않고, 실행 시점 `_engage_allowed`에서
+    STOP으로 떨어지게 둔다.
+
+    LOS는 보지 않는다. 후보 x 유닛 x 표적마다 광선 판정을 하면 비싸고, 실측에서
+    차단 사유는 사거리 밖 76.8% / LOS 23.2%라 사거리만으로 대부분이 걸러진다.
+
+    step 0은 건드리지 않는다. `_apply_current_engage_hard_mask`가 현재 상태로 이미
+    유효 표적만 남겼고, 그쪽이 예측보다 정확하다.
+
+    시점 대응: action step k는 상태 k -> k+1 전이다. history가 `H`프레임일 때 plan
+    step k의 **직전 상태**는 전체 인덱스 `H-1+k`이고, `future_features[:, j]`는 전체
+    인덱스 `H+j`다. 따라서 plan step k(k>=1)의 직전 상태는 `future_features[:, k-1]`.
+    """
+    _expect_rank("future_features", future_features, 4)
+    candidates, horizon, num_units = plan.action_type_ids.shape
+    if future_features.shape[0] != candidates:
+        raise ValueError("future_features candidate 수가 plan과 같아야 한다")
+    if future_features.shape[1] < horizon - 1:
+        raise ValueError("future_features 예측 길이가 horizon-1보다 짧다")
+    if horizon <= 1:
+        return plan
+
+    red_indices = _team_slot_indices(current_batch, TeamId.RED, device=device)
+    blue_indices = _team_slot_indices(current_batch, TeamId.BLUE, device=device)
+    num_red = int(red_indices.numel())
+    if num_red <= 0 or int(blue_indices.numel()) != num_units:
+        return plan
+
+    span_x = 0.5 * (WORLD_X_MAX - WORLD_X_MIN)
+    span_y = 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN)
+    scale = torch.tensor([span_x, span_y], dtype=torch.float32, device=device)
+
+    target_indices = plan.target_indices.clone()
+    target_entity_ids = plan.target_entity_ids.clone()
+    action_features = plan.action_features.clone()
+    engage_mask = plan.issued_mask & (plan.action_type_ids == int(ActionType.ENGAGE))
+
+    for step in range(1, horizon):
+        step_mask = engage_mask[:, step]
+        if not bool(step_mask.any()):
+            continue
+        state = future_features[:, step - 1].to(device=device, dtype=torch.float32)
+        blue_xy = state.index_select(1, blue_indices)[..., [UNIT_X_INDEX, UNIT_Y_INDEX]]
+        red_state = state.index_select(1, red_indices)
+        red_xy = red_state[..., [UNIT_X_INDEX, UNIT_Y_INDEX]]
+
+        # 정규좌표를 월드 단위로 되돌려야 사거리와 같은 축에서 잰다.
+        delta = (blue_xy.unsqueeze(2) - red_xy.unsqueeze(1)) * scale
+        distance = delta.norm(dim=-1)                                  # (C, U, R)
+
+        alive = red_state[..., UNIT_ALIVE_INDEX] >= 0.5                # (C, R)
+        # 그 시점에 살아 있고 사거리 안에 든 적. 이 안에서 균등하게 뽑는다.
+        shootable = alive.unsqueeze(1) & (distance <= MAX_FIRE_RANGE)   # (C, U, R)
+        has_shootable = shootable.any(dim=-1)                           # (C, U)
+
+        # 사거리 안이 비어 있으면 multinomial이 실패하므로 균등으로 채워 두고,
+        # 아래 keep에서 그 항목을 걸러 원래 표적을 유지한다.
+        weight = torch.where(
+            has_shootable.unsqueeze(-1), shootable.float(), torch.ones_like(shootable, dtype=torch.float32)
+        )
+        sampled = torch.multinomial(
+            weight.reshape(candidates * num_units, num_red), 1, generator=generator
+        ).reshape(candidates, num_units)
+
+        keep = step_mask & has_shootable
+        target_indices[:, step] = torch.where(keep, sampled, target_indices[:, step])
+
+        chosen = target_indices[:, step]
+        target_entity_ids[:, step] = torch.where(
+            keep,
+            plan.red_target_ids.index_select(0, chosen.reshape(-1)).reshape(candidates, num_units),
+            target_entity_ids[:, step],
+        )
+        # 명령이 싣는 표적 좌표도 그 시점 예측 위치로 맞춘다.
+        chosen_xy = _clip_move_xy(
+            torch.gather(red_xy, 1, chosen.unsqueeze(-1).expand(candidates, num_units, 2))
+        )
+        for axis, index in ((0, TARGET_X_INDEX), (1, TARGET_Y_INDEX)):
+            action_features[:, step, :, index] = torch.where(
+                keep, chosen_xy[..., axis], action_features[:, step, :, index]
+            )
+
+    return FutureActionPlanBatch(
+        action_features=action_features,
+        action_unit_ids=plan.action_unit_ids,
+        issued_mask=plan.issued_mask,
+        action_type_ids=plan.action_type_ids,
+        target_entity_ids=target_entity_ids,
+        target_indices=target_indices,
+        move_xy_norm=plan.move_xy_norm,
+        theta_radians=plan.theta_radians,
+        red_target_ids=plan.red_target_ids,
     )
 
 
@@ -1112,6 +1172,7 @@ def optimize_cem(
         _expect_rank("future_features", future_features, 4)
         if future_features.shape[0] != config.num_candidates:
             raise ValueError("rollout_fn이 반환한 candidate 수가 config.num_candidates와 같아야 한다")
+
         scores = score_fn(future_features)
         _expect_rank("scores", scores, 1)
         _expect_finite("scores", scores)
@@ -1137,6 +1198,18 @@ def optimize_cem(
             plans=plans,
             elite_indices=elite_indices,
             config=config,
+        )
+
+    if config.retarget_engage:
+        # 실제로 실행될 계획 하나만 교정한다. 후보 전체를 교정하면 rollout이 2배가
+        # 되는데(300x30이면 재계획당 18,000), 표적은 분포 갱신의 주 대상이 아니라
+        # 그만큼 얻는 게 없다. 여기서는 후보 1개짜리 rollout 한 번만 더 든다.
+        best_plan = retarget_engage_from_prediction(
+            plan=best_plan,
+            future_features=rollout_fn(best_plan),
+            current_batch=current_batch,
+            generator=generator,
+            device=device,
         )
 
     return CEMResult(
@@ -1202,29 +1275,45 @@ def rollout_with_world_model(
     observed_actions: ObservedActionWindow,
     future_plans: FutureActionPlanBatch,
     device: torch.device,
+    chunk_size: int = ROLLOUT_CHUNK_SIZE,
 ) -> torch.Tensor:
-    """월드모델로 CEM 후보들의 future feature를 예측한다."""
+    """월드모델로 CEM 후보들의 future feature를 예측한다.
+
+    후보를 chunk_size씩 끊어 굴린다. attention이 후보 축까지 배치로 펼쳐지므로
+    한 번에 넣으면 후보 수에 비례해 메모리가 커진다 — 실측에서 후보 300개가
+    39.9GB를 쓰고 9.4GB를 더 요구하며 OOM이 났다(후보당 약 0.13GB).
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size는 0보다 커야 한다")
     history = stack_slot_history(history_batches, device=device)
     candidates = future_plans.action_features.shape[0]
     action_features, action_unit_ids, issued_mask = combine_observed_and_future_actions(
         observed=observed_actions,
         future=future_plans,
     )
+    action_features = action_features.to(device=device)
+    action_unit_ids = action_unit_ids.to(device=device)
+    issued_mask = issued_mask.to(device=device)
 
     model.eval()
+    chunks: list[torch.Tensor] = []
     with torch.no_grad():
-        output = model.rollout_cjepa_future(
-            history_features=history["features"].unsqueeze(0).expand(candidates, *history["features"].shape),
-            history_feature_mask=history["feature_mask"].unsqueeze(0).expand(candidates, *history["feature_mask"].shape),
-            history_type_ids=history["type_ids"].unsqueeze(0).expand(candidates, *history["type_ids"].shape),
-            history_entity_ids=history["entity_ids"].unsqueeze(0).expand(candidates, *history["entity_ids"].shape),
-            history_team_ids=history["team_ids"].unsqueeze(0).expand(candidates, *history["team_ids"].shape),
-            history_alive_mask=history["alive_mask"].unsqueeze(0).expand(candidates, *history["alive_mask"].shape),
-            action_features=action_features.to(device=device),
-            action_unit_ids=action_unit_ids.to(device=device),
-            issued_mask=issued_mask.to(device=device),
-        )
-    return output["future_features"]
+        for begin in range(0, candidates, chunk_size):
+            end = min(begin + chunk_size, candidates)
+            size = end - begin
+            output = model.rollout_cjepa_future(
+                history_features=history["features"].unsqueeze(0).expand(size, *history["features"].shape),
+                history_feature_mask=history["feature_mask"].unsqueeze(0).expand(size, *history["feature_mask"].shape),
+                history_type_ids=history["type_ids"].unsqueeze(0).expand(size, *history["type_ids"].shape),
+                history_entity_ids=history["entity_ids"].unsqueeze(0).expand(size, *history["entity_ids"].shape),
+                history_team_ids=history["team_ids"].unsqueeze(0).expand(size, *history["team_ids"].shape),
+                history_alive_mask=history["alive_mask"].unsqueeze(0).expand(size, *history["alive_mask"].shape),
+                action_features=action_features[begin:end],
+                action_unit_ids=action_unit_ids[begin:end],
+                issued_mask=issued_mask[begin:end],
+            )
+            chunks.append(output["future_features"])
+    return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
 
 def _format_plan_line(plan: FutureActionPlanBatch, candidate_index: int, step_index: int) -> str:

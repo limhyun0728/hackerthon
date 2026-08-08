@@ -1145,8 +1145,11 @@ class CEMCommanderAtomic(AtomicDEVS):
                 red_target_priority=self.red_target_priority,
             )
             # 마지막 CEM iteration의 (후보, 실제 미래) 쌍을 학습 회수용으로 보관한다.
-            holder["plans"] = plans
-            holder["features"] = features
+            # optimize_cem은 마지막에 실행될 계획 1개만 다시 굴려 표적을 교정하는데,
+            # 그 호출까지 담으면 holder가 후보 1개로 덮여 replay 회수가 날아간다.
+            if int(plans.action_features.shape[0]) > 1:
+                holder["plans"] = plans
+                holder["features"] = features
             return features
 
         return rollout_fn, holder
@@ -1481,6 +1484,27 @@ class CEMCommanderAtomic(AtomicDEVS):
         population_mean = result.iteration_stats[-1].population_mean
         return result.best_plan, f"cem_{self.rollout_backend}", result.best_score, population_mean
 
+    def _resample_engage_target(
+        self,
+        *,
+        shooter_id: int,
+        row_by_id: Mapping[int, Mapping[str, object]],
+    ) -> int | None:
+        """지금 쏠 수 있는 RED 중에서 균등하게 하나 고른다. 없으면 None.
+
+        `devs_rollout.ScriptedPlanCommanderAtomic._resample_engage_target`과 같은
+        규칙이어야 CEM이 채점한 계획과 실제 실행이 어긋나지 않는다.
+        """
+        shootable = [
+            target_id
+            for target_id in RED_IDS
+            if target_id in row_by_id
+            and self._engage_allowed(shooter_id=shooter_id, target_id=target_id, row_by_id=row_by_id)
+        ]
+        if not shootable:
+            return None
+        return int(random.choice(shootable))
+
     def _engage_allowed(
         self,
         *,
@@ -1597,7 +1621,7 @@ class CEMCommanderAtomic(AtomicDEVS):
                 continue
             action_type_id = int(plan.action_type_ids[0, step_index, unit_index].detach().cpu().item())
             if action_type_id == 0:
-                commands.append({"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": "cem stop"})
+                commands.append({"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": f"cem stop|plan=STOP|step={step_index}"})
             elif action_type_id == 1:
                 target_x = _world_x_from_norm(plan.move_xy_norm[0, step_index, unit_index, 0])
                 target_y = _world_y_from_norm(plan.move_xy_norm[0, step_index, unit_index, 1])
@@ -1612,7 +1636,7 @@ class CEMCommanderAtomic(AtomicDEVS):
                     if projected is not None:
                         waypoint = next_waypoint(current_pos, projected, self.obstacles, max_step=1.5)
                 if waypoint is None:
-                    commands.append({"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": "cem move blocked"})
+                    commands.append({"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": f"cem move blocked|plan=MOVE|step={step_index}"})
                 else:
                     commands.append(
                         {
@@ -1621,7 +1645,7 @@ class CEMCommanderAtomic(AtomicDEVS):
                             "x": round(float(waypoint[0]), 3),
                             "y": round(float(waypoint[1]), 3),
                             "duration_sec": 1.0,
-                            "reason": "cem move",
+                            "reason": f"cem move|plan=MOVE|step={step_index}",
                         }
                     )
             elif action_type_id == 2:
@@ -1633,18 +1657,33 @@ class CEMCommanderAtomic(AtomicDEVS):
                             "action": "ENGAGE",
                             "target_id": target_id,
                             "duration_sec": 1.0,
-                            "reason": "cem engage",
+                            "reason": f"cem engage|plan=ENGAGE|step={step_index}",
                         }
                     )
                 else:
-                    commands.append(
-                        {
-                            "unit_id": unit_id,
-                            "action": "STOP",
-                            "duration_sec": 1.0,
-                            "reason": "cem engage blocked by los/range",
-                        }
-                    )
+                    # 계획은 예측 상태로 표적을 골랐다. 예측이 빗나가 그 표적을 못 쏘면
+                    # STOP으로 버리지 않고 지금 쏠 수 있는 적으로 갈아탄다.
+                    # devs_rollout의 채점용 변환과 같은 규칙이어야 한다.
+                    fallback = self._resample_engage_target(shooter_id=unit_id, row_by_id=row_by_id)
+                    if fallback is not None:
+                        commands.append(
+                            {
+                                "unit_id": unit_id,
+                                "action": "ENGAGE",
+                                "target_id": fallback,
+                                "duration_sec": 1.0,
+                                "reason": f"cem engage resampled|plan=ENGAGE|step={step_index}",
+                            }
+                        )
+                    else:
+                        commands.append(
+                            {
+                                "unit_id": unit_id,
+                                "action": "STOP",
+                                "duration_sec": 1.0,
+                                "reason": f"cem engage blocked|plan=ENGAGE|step={step_index}",
+                            }
+                        )
             elif action_type_id == 3:
                 theta = float(plan.theta_radians[0, step_index, unit_index].detach().cpu().item())
                 commands.append(
@@ -1653,7 +1692,7 @@ class CEMCommanderAtomic(AtomicDEVS):
                         "action": "TURN",
                         "theta": round(math.degrees(theta), 2),
                         "duration_sec": 1.0,
-                        "reason": "cem turn",
+                        "reason": f"cem turn|plan=TURN|step={step_index}",
                     }
                 )
             else:

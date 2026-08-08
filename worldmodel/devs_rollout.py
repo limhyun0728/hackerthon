@@ -222,6 +222,17 @@ class ScriptedPlanCommanderAtomic(AtomicDEVS):
                     "duration_sec": 1.0,
                     "reason": "rollout engage",
                 }
+            # 계획한 표적이 지금 못 쏘는 상태면 쏠 수 있는 적 중에서 다시 고른다.
+            # 계획은 예측 상태로 표적을 골랐으므로 예측이 빗나가면 여기서 갈린다.
+            fallback = self._resample_engage_target(shooter_id=unit_id, row_by_id=row_by_id)
+            if fallback is not None:
+                return {
+                    "unit_id": unit_id,
+                    "action": "ENGAGE",
+                    "target_id": fallback,
+                    "duration_sec": 1.0,
+                    "reason": "rollout engage resampled",
+                }
             return {"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": "rollout engage blocked"}
         if action_type_id == 3:
             theta = float(self.plan.theta_radians[step_index, unit_index])
@@ -233,6 +244,28 @@ class ScriptedPlanCommanderAtomic(AtomicDEVS):
                 "reason": "rollout turn",
             }
         raise ValueError(f"DEVS action vocabulary에 없는 action_type_id: {action_type_id}")
+
+    def _resample_engage_target(
+        self,
+        *,
+        shooter_id: int,
+        row_by_id: Mapping[int, Mapping[str, object]],
+    ) -> int | None:
+        """지금 쏠 수 있는 적 중에서 균등하게 하나 고른다. 없으면 None.
+
+        계획은 예측 상태로 표적을 정하므로 예측이 빗나가면 그 표적을 못 쏜다.
+        그때 STOP으로 버리는 대신 쏠 수 있는 적으로 갈아탄다. 실행부
+        `_commands_from_plan`과 **같은 규칙**이어야 채점과 실행이 어긋나지 않는다.
+        """
+        shootable = [
+            target_id
+            for target_id in row_by_id
+            if target_id > BLUE_ID_MAX
+            and self._engage_allowed(shooter_id=shooter_id, target_id=target_id, row_by_id=row_by_id)
+        ]
+        if not shootable:
+            return None
+        return int(random.choice(sorted(shootable)))
 
     def _engage_allowed(
         self,
