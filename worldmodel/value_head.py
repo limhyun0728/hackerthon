@@ -31,6 +31,7 @@ from torch import nn
 
 from hackerthon.worldmodel.slots import ObjectType
 from hackerthon.worldmodel.object_slot_attention import (
+    STATIC_TERRAIN_KV,
     ObjectSlotModelConfig,
     ObjectSlotTransformer,
     TypedObjectSlotEncoder,
@@ -55,8 +56,25 @@ OBJECTIVE_GAP_SCALE = 10.0
 # slot feature 안의 index. 기하 특징을 직접 계산할 때 쓴다.
 UNIT_HP_INDEX, UNIT_X_INDEX, UNIT_Y_INDEX = 1, 3, 4
 MISSION_OBJECTIVE_X_INDEX, MISSION_OBJECTIVE_Y_INDEX = 1, 2
-# 기하 특징 개수 : 목표까지 최소/평균거리, 적까지 최소/평균거리, 생존비 2개
-NUM_GEOMETRY_FEATURES = 6
+MISSION_TIME_REMAINING_INDEX = 3
+# 경과 시간으로 나눌 때의 하한. t=0 근처에서 진척률이 발산하는 것을 막는다.
+MIN_ELAPSED_RATIO = 0.05
+# 기하 특징 : 목표까지 최소/평균거리, 적까지 최소거리, 생존비 3개,
+#            적/아군 HP비, 경과 시간비, 시간당 피해율
+NUM_GEOMETRY_FEATURES = 10
+NUM_MISSION_TYPES = 4
+# 기하 특징 x 임무 one-hot 외적. "이 임무에서 이 특징을 볼지"를 선형으로 표현한다.
+#
+# concat만으로는 부족했다. 임무 정보가 202차원 중 4개뿐인데 기하 특징과 **곱셈으로**
+# 상호작용해야 하기 때문이다. 실측에서 임무별로 목표거리와 달성도의 상관 부호가
+# 갈린다 — destroy_and_reach -0.237 / hold_objective -0.401 / reach_objective -0.295
+# 인데 destroy_all만 +0.065다. 목표가 그 임무의 승리 조건에 없으니 당연하다.
+#
+# 데이터의 3/4이 "목표에 가까울수록 좋다"고 말하는데 destroy_all만 반대라, one-hot을
+# 이어붙이기만 해서는 그 하나를 뒤집지 못했다. 규칙 780 에피소드로 재학습했더니
+# 나머지 셋은 올랐지만(hold +0.118 -> +0.615) destroy_all은 +0.006 -> -0.256으로
+# 부호가 뒤집혔다.
+NUM_GEOMETRY_MISSION_FEATURES = NUM_GEOMETRY_FEATURES * NUM_MISSION_TYPES
 
 
 @dataclass(frozen=True)
@@ -104,9 +122,12 @@ class ValueHead(nn.Module):
             dropout=config.dropout,
         )
         dim = config.embedding_dim
-        # BLUE pool + RED pool + 전체 pool + 임무 one-hot(4) + 기하 특징
+        # BLUE pool + RED pool + 전체 pool + 임무 one-hot(4) + 기하 특징 + 기하x임무
         self.trunk = nn.Sequential(
-            nn.Linear(dim * 3 + 4 + NUM_GEOMETRY_FEATURES, config.hidden_dim),
+            nn.Linear(
+                dim * 3 + NUM_MISSION_TYPES + NUM_GEOMETRY_FEATURES + NUM_GEOMETRY_MISSION_FEATURES,
+                config.hidden_dim,
+            ),
             nn.GELU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.GELU(),
@@ -123,17 +144,33 @@ class ValueHead(nn.Module):
         type_ids: torch.Tensor,
         blue_mask: torch.Tensor,
         red_mask: torch.Tensor,
+        alive_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """목표·적까지의 거리와 생존비를 스칼라로 뽑는다.
+        """목표·적까지의 거리, 생존비, 전투 진척률을 스칼라로 뽑는다.
 
-        좌표만 주고 관계를 알아서 배우게 두면 안 된다. 목표 좌표는 mission slot에,
-        유닛 좌표는 unit slot에 따로 있어 **차이를 계산해야** 하는데, pooling이
-        평균을 내버려 개별 유닛과 목표의 상대 위치가 사라진다. 실제로 그렇게 학습한
-        V는 "목표에 접근하면 달성도가 내려간다"고 예측했다 — 데이터의 실제 상관은
-        -0.36(가까울수록 좋음)인데 부호를 반대로 배웠다.
+        `blue_mask`/`red_mask`는 생존 여부를 안 씌운 전체 slot이다. 죽은 유닛도 slot에
+        남으므로 그 개수가 곧 초기 병력이고, 그래야 "초기 대비 얼마나 깎았나"를 낼 수
+        있다. 생존만 세는 값은 안에서 `alive_mask`로 따로 만든다.
 
-        적 HP는 slot feature에 직접 있어 pooling으로 그대로 전달되므로 옳게 배웠다.
-        차이가 나는 부분만 명시적으로 넣는다.
+        **시간당 피해율이 핵심이다.** 라벨은 에피소드 종료 시점의 격파 비율인데, 상태만
+        보고는 "지금 이만큼 깎은 게 잘한 건가"를 알 수 없다. t=10에 20% 깎은 것과
+        t=50에 20% 깎은 것은 전혀 다르다. 실측 순위상관:
+
+            임무                  현재 적HP비   누적피해/경과
+            destroy_all            -0.264       +0.403
+            destroy_and_reach      -0.296       +0.459
+            hold_objective         -0.096       +0.119
+            reach_objective        -0.005       +0.032
+
+        격파가 승리 조건에 든 두 임무에서 신호가 1.5배가 된다. reach 계열에서는 목표까지
+        거리가 이미 그 역할을 하므로 효과가 없다. 남은 시간만 넣는 것은 소용없다
+        (상관 -0.002 ~ +0.009) — 누적 피해와 함께여야 진척률이 된다.
+
+        좌표를 주고 관계를 알아서 배우게 두면 안 되는 것도 같은 이유다. 목표 좌표는
+        mission slot에, 유닛 좌표는 unit slot에 따로 있어 **차이를 계산해야** 하는데
+        pooling이 평균을 내버려 상대 위치가 사라진다. 실제로 그렇게 학습한 V는 "목표에
+        접근하면 달성도가 내려간다"고 예측했다 — 데이터의 실제 상관은 -0.36(가까울수록
+        좋음)인데 부호를 반대로 배웠다.
         """
         batch_size = features.shape[0]
         device = features.device
@@ -159,22 +196,46 @@ class ValueHead(nn.Module):
             average = torch.where(count > 0, total / count.clamp_min(1.0), torch.full_like(total, 2.0))
             return minimum, average
 
-        objective_min, objective_mean = summarize(blue_mask, to_objective)
+        blue_alive = blue_mask & alive_mask
+        red_alive = red_mask & alive_mask
+        objective_min, objective_mean = summarize(blue_alive, to_objective)
 
         # BLUE-RED 최소 거리. 교전 임박도를 나타낸다.
-        blue_position = torch.where(blue_mask.unsqueeze(-1), position, torch.full_like(position, 1e3))
-        red_position = torch.where(red_mask.unsqueeze(-1), position, torch.full_like(position, -1e3))
+        blue_position = torch.where(blue_alive.unsqueeze(-1), position, torch.full_like(position, 1e3))
+        red_position = torch.where(red_alive.unsqueeze(-1), position, torch.full_like(position, -1e3))
         pairwise = torch.cdist(blue_position, red_position)
         contact_min = pairwise.min(dim=2).values.min(dim=1).values.clamp(max=2.0)
-        has_pair = (blue_mask.any(dim=1) & red_mask.any(dim=1)).to(features.dtype)
+        has_pair = (blue_alive.any(dim=1) & red_alive.any(dim=1)).to(features.dtype)
         contact_min = contact_min * has_pair + 2.0 * (1.0 - has_pair)
 
-        blue_count = blue_mask.sum(dim=1).to(features.dtype)
-        red_count = red_mask.sum(dim=1).to(features.dtype)
+        blue_count = blue_alive.sum(dim=1).to(features.dtype)
+        red_count = red_alive.sum(dim=1).to(features.dtype)
         ratio = blue_count / (blue_count + red_count).clamp_min(1.0)
 
+        # 초기 병력은 전체 slot 수다. 죽은 유닛도 slot에 hp=0으로 남는다.
+        hp_ratio = features[..., UNIT_HP_INDEX]
+        initial_blue = blue_mask.sum(dim=1).to(features.dtype).clamp_min(1.0)
+        initial_red = red_mask.sum(dim=1).to(features.dtype).clamp_min(1.0)
+        blue_hp_ratio = (hp_ratio * blue_mask.to(features.dtype)).sum(dim=1) / initial_blue
+        red_hp_ratio = (hp_ratio * red_mask.to(features.dtype)).sum(dim=1) / initial_red
+
+        time_remaining = features[rows, mission_index][:, MISSION_TIME_REMAINING_INDEX]
+        elapsed = (1.0 - time_remaining).clamp(0.0, 1.0)
+        damage_rate = (1.0 - red_hp_ratio) / elapsed.clamp_min(MIN_ELAPSED_RATIO)
+
         return torch.stack(
-            [objective_min, objective_mean, contact_min, ratio, blue_count / 10.0, red_count / 10.0],
+            [
+                objective_min,
+                objective_mean,
+                contact_min,
+                ratio,
+                blue_count / 10.0,
+                red_count / 10.0,
+                blue_hp_ratio,
+                red_hp_ratio,
+                elapsed,
+                damage_rate,
+            ],
             dim=-1,
         )
 
@@ -201,15 +262,47 @@ class ValueHead(nn.Module):
         """상태 배치에서 최종 결과 예측을 낸다."""
         tokens = self.slot_encoder(features, feature_mask, type_ids, team_ids)
         allowed = build_object_attention_mask(type_ids, alive_mask)
-        tokens = self.interaction(tokens, allowed)
+        if STATIC_TERRAIN_KV:
+            # 지형을 query에서 빼고 key/value로만 둔다. pooling이 유닛만 쓰므로 지형
+            # 토큰의 출력은 어차피 안 쓰이는데, attention이 N^2이라 slot의 89%인 지형이
+            # 비용의 대부분을 차지한다. 배치 안 slot layout이 같다고 보고 첫 항목으로
+            # 나눈다 (predictor와 같은 가정).
+            is_query = type_ids[0] != int(ObjectType.TERRAIN)
+            if not bool(is_query.all()):
+                query_index = torch.nonzero(is_query, as_tuple=False).flatten()
+                static_index = torch.nonzero(~is_query, as_tuple=False).flatten()
+                query_tokens = tokens.index_select(1, query_index)
+                static_tokens = tokens.index_select(1, static_index)
+                # key 축은 query slot 다음에 static slot이 오도록 다시 정렬한다.
+                allowed = torch.cat(
+                    [
+                        allowed.index_select(1, query_index).index_select(2, query_index),
+                        allowed.index_select(1, query_index).index_select(2, static_index),
+                    ],
+                    dim=2,
+                )
+                updated = self.interaction(
+                    query_tokens, allowed, static_context=static_tokens
+                )
+                tokens = tokens.index_copy(1, query_index, updated)
+            else:
+                tokens = self.interaction(tokens, allowed)
+        else:
+            tokens = self.interaction(tokens, allowed)
 
+        geometry = self._geometry(features, type_ids, blue_mask, red_mask, alive_mask)
+        # 기하 x 임무 외적. 임무마다 어떤 기하 특징을 볼지 선형으로 고를 수 있게 한다.
+        geometry_by_mission = (
+            geometry.unsqueeze(-1) * mission_onehot.unsqueeze(1)
+        ).flatten(start_dim=1)
         pooled = torch.cat(
             [
                 self._masked_mean(tokens, blue_mask & alive_mask),
                 self._masked_mean(tokens, red_mask & alive_mask),
                 self._masked_mean(tokens, alive_mask),
                 mission_onehot,
-                self._geometry(features, type_ids, blue_mask & alive_mask, red_mask & alive_mask),
+                geometry,
+                geometry_by_mission,
             ],
             dim=-1,
         )

@@ -380,29 +380,47 @@ class ObjectSelfAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, tokens: torch.Tensor, attention_allowed: torch.Tensor) -> torch.Tensor:
-        """attention_allowed=True인 slot 쌍만 self-attention에 사용한다."""
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        attention_allowed: torch.Tensor,
+        *,
+        static_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """attention_allowed=True인 slot 쌍만 self-attention에 사용한다.
+
+        `static_context`를 주면 그 token들을 key/value로만 붙인다. 지형처럼 정지한
+        객체를 query에서 빼기 위한 것이고, `attention_allowed`의 key 축이 그만큼
+        길어야 한다. predictor 쪽과 같은 이유다 — 층이 여러 개면 다음 층의 지형 key가
+        이 층의 지형 출력이라, 고정하지 않으면 query에서 뺄 수 없다.
+        """
         _expect_rank("tokens", tokens, 3)
         _expect_rank("attention_allowed", attention_allowed, 3)
         _expect_bool("attention_allowed", attention_allowed)
-        batch_size, num_slots, _ = tokens.shape
-        if attention_allowed.shape != (batch_size, num_slots, num_slots):
-            raise ValueError("attention_allowed shape는 (B, N, N)이어야 한다")
+        batch_size, num_query, _ = tokens.shape
+        num_key = num_query if static_context is None else num_query + static_context.shape[1]
+        if attention_allowed.shape != (batch_size, num_query, num_key):
+            raise ValueError("attention_allowed shape는 (B, N_query, N_key)이어야 한다")
 
         blocked = ~attention_allowed
         attn_mask = blocked.unsqueeze(1).expand(
             batch_size,
             self.num_heads,
-            num_slots,
-            num_slots,
+            num_query,
+            num_key,
         )
-        attn_mask = attn_mask.reshape(batch_size * self.num_heads, num_slots, num_slots)
+        attn_mask = attn_mask.reshape(batch_size * self.num_heads, num_query, num_key)
 
         attn_input = self.attn_norm(tokens)
+        if static_context is None:
+            key_value = attn_input
+        else:
+            _expect_rank("static_context", static_context, 3)
+            key_value = torch.cat([attn_input, self.attn_norm(static_context)], dim=1)
         attn_out, _ = self.attn(
             attn_input,
-            attn_input,
-            attn_input,
+            key_value,
+            key_value,
             attn_mask=attn_mask,
             need_weights=False,
         )
@@ -424,10 +442,19 @@ class ObjectSlotTransformer(nn.Module):
         )
         self.output_norm = nn.LayerNorm(embedding_dim)
 
-    def forward(self, tokens: torch.Tensor, attention_allowed: torch.Tensor) -> torch.Tensor:
-        """객체 slot들의 관계 표현을 갱신한다."""
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        attention_allowed: torch.Tensor,
+        *,
+        static_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """객체 slot들의 관계 표현을 갱신한다.
+
+        `static_context`는 층마다 갱신하지 않고 그대로 넘긴다.
+        """
         for layer in self.layers:
-            tokens = layer(tokens, attention_allowed)
+            tokens = layer(tokens, attention_allowed, static_context=static_context)
         return self.output_norm(tokens)
 
 
