@@ -42,7 +42,10 @@ VALID_RATIO_MAX = 1.0
 NO_ALIVE_BLUE_DISTANCE = math.hypot(WORLD_X_MAX - WORLD_X_MIN, WORLD_Y_MAX - WORLD_Y_MIN)
 
 
-BLUE_MAX_STEP_PER_SEC = 1.5
+# 전진 항을 [-1, 1]로 정규화할 때 쓰는 1초 최대 이동거리(유닛).
+# 실행부의 next_waypoint max_step과 같아야 한다. 이 값이 실제보다 크면
+# 전진 항이 만점에 못 닿아 피해 항 대비 과소평가된다.
+BLUE_MAX_STEP_PER_SEC = 1.0
 
 
 @dataclass(frozen=True)

@@ -44,7 +44,7 @@ def _dist(p: Tuple[float, float], q: Tuple[float, float]) -> float:
 
 
 class Executor:
-    def __init__(self, controlled_ids: List[int], obstacles, max_step: float = 1.5):
+    def __init__(self, controlled_ids: List[int], obstacles, max_step: float = 1.0):
         self.controlled_ids = list(controlled_ids)
         self.obstacles = obstacles
         self.max_step = float(max_step)

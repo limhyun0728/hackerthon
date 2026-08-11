@@ -146,6 +146,7 @@ class UrbanRedPolicy:
         target_priority: str = "nearest",
         lane_seed: int = 0,
         assault_target: Optional[Tuple[float, float]] = None,
+        max_step: float = 1.0,
     ):
         if target_priority not in ("nearest", "low_hp", "smart"):
             raise ValueError("target_priority는 nearest, low_hp 또는 smart여야 한다")
@@ -153,6 +154,11 @@ class UrbanRedPolicy:
         self.obstacles = list(obstacles or [])
         self.target_priority = target_priority
         self.lane_seed = int(lane_seed)
+        # 1틱 이동 상한(유닛). 양 팀 모두 1.0이고 CEM/executor/devs_rollout과 같다.
+        # 팀마다 다르면 MOVE 목적지 스케일이 갈리는데, 월드모델은 그 좌표를
+        # "1초 뒤 위치"로 배우므로 예측이 통째로 어긋난다. 인자로 뺀 것은 값을
+        # 바꾸려는 게 아니라 호출부가 같은 상수를 넘겨 통일을 강제하기 위해서다.
+        self.max_step = float(max_step)
         # 값이 있으면 순찰 대신 그 거점을 공격한다. BLUE의 거점 방어 임무에서만 켠다.
         self.assault_target = (
             (float(assault_target[0]), float(assault_target[1]))
@@ -167,7 +173,7 @@ class UrbanRedPolicy:
         return {"unit_id": unit_id, "action": "STOP", "reason": reason}
 
     def _move(self, unit_id: int, me: Tuple[float, float], goal: Tuple[float, float], reason: str) -> Dict[str, Any]:
-        waypoint = next_waypoint(me, goal, self.obstacles, max_step=1.0)
+        waypoint = next_waypoint(me, goal, self.obstacles, max_step=self.max_step)
         if waypoint is None:
             return {"unit_id": unit_id, "action": "TURN", "theta": 45.0, "reason": "route blocked: scan"}
         return {
@@ -300,7 +306,7 @@ class UrbanRedPolicy:
         # 도착해야만 다음 lane으로 넘어가므로, 경로가 없는 lane을 잡으면 영구 고착된다.
         # 막힌 lane은 그 자리에서 건너뛰고 갈 수 있는 lane을 찾는다.
         for _ in range(len(lanes)):
-            waypoint = next_waypoint(me, goal, self.obstacles, max_step=1.0)
+            waypoint = next_waypoint(me, goal, self.obstacles, max_step=self.max_step)
             if waypoint is not None:
                 return {
                     "unit_id": unit_id,

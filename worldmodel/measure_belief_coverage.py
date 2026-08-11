@@ -48,7 +48,7 @@ from hackerthon.worldmodel.object_slot_attention import (
 from hackerthon.worldmodel.slots import ObjectType, build_slot_batch
 
 # 팀별 실측 최대 이동속도 (유닛/초). 로그 p99/max 기준이며 원 반경의 근거다.
-BLUE_MAX_SPEED = 1.5
+BLUE_MAX_SPEED = 1.0
 RED_MAX_SPEED = 1.0
 METERS_PER_UNIT = 10.0
 

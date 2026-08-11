@@ -34,7 +34,10 @@ from hackerthon.simulation_direct_commander_5v5 import RulePolicyAtomic  # noqa:
 from hackerthon.sim_units import LosSoldierAtomic, LosWorldAtomic  # noqa: E402
 from hackerthon.terrain import clamp_to_world, has_los, next_waypoint  # noqa: E402
 
-from hackerthon.worldmodel.cem_planner import FutureActionPlanBatch  # noqa: E402
+from hackerthon.worldmodel.cem_planner import (  # noqa: E402
+    MAX_MOVE_PER_STEP,
+    FutureActionPlanBatch,
+)
 from hackerthon.worldmodel.slots import MAX_FEATURE_DIM, SlotBatch, build_slot_batch  # noqa: E402
 from hackerthon.terrain import WORLD_X_MAX, WORLD_X_MIN, WORLD_Y_MAX, WORLD_Y_MIN  # noqa: E402
 
@@ -201,7 +204,7 @@ class ScriptedPlanCommanderAtomic(AtomicDEVS):
             target_y = _denorm_y(self.plan.move_xy_norm[step_index, unit_index, 1])
             target_x, target_y = clamp_to_world(target_x, target_y)
             current_pos = (float(row_by_id[unit_id]["x"]), float(row_by_id[unit_id]["y"]))
-            waypoint = next_waypoint(current_pos, (target_x, target_y), self.obstacles, max_step=1.5)
+            waypoint = next_waypoint(current_pos, (target_x, target_y), self.obstacles, max_step=MAX_MOVE_PER_STEP)
             if waypoint is None:
                 return {"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": "rollout move blocked"}
             return {
@@ -405,6 +408,14 @@ def _frames_to_features(
     }
     for step in range(1, horizon + 1):
         frame_rows = frames.get(float(step), {})
+        if not frame_rows and all(float(row["hp"]) > 0.0 for row in last_known.values()):
+            # 전원 생존인데 프레임이 통째로 비는 건 시뮬레이션이 짧게 끝났다는 뜻이다.
+            # 아래 last_known 대체가 이걸 "아무도 안 움직였다"로 바꿔 조용히 삼킨다.
+            # 전사자가 생긴 뒤 프레임이 비는 것은 정상이라 그때는 대체를 그대로 쓴다.
+            raise ValueError(
+                f"DEVS rollout에 t={float(step)} 프레임이 없다 "
+                f"(기록된 시각: {sorted(frames)}). 종료시각이 horizon보다 짧다."
+            )
         merged: list[dict[str, str]] = []
         for unit_id in all_ids:
             if unit_id in frame_rows:
@@ -460,7 +471,15 @@ def rollout_plans_with_devs(
                 red_target_priority=red_target_priority,
             )
             simulator = Simulator(battle)
-            simulator.setTerminationTime(float(horizon) + 0.5)
+            # commander는 t=0(초기 상태)부터 1초 간격으로 기록하는데
+            # _frames_to_features는 t=1..horizon을 읽는다. 즉 마지막으로 필요한
+            # 기록 시각이 horizon이므로 종료시각이 horizon+0.5면 그 프레임이
+            # 만들어지기 전에 시뮬레이션이 끝난다. 그러면 _frames_to_features가
+            # last_known으로 직전 프레임을 복제해, 진실의 마지막 스텝이 조용히
+            # "아무도 안 움직였다"가 된다 — 실측에서 후보 전체의 f4->f5 이동이
+            # 정확히 0.000m였다. 학습 replay 타깃이 이 경로를 쓰므로 미래
+            # 프레임의 1/6이 정지를 가르치고 있었다.
+            simulator.setTerminationTime(float(horizon) + 1.5)
             simulator.simulate()
             features.append(
                 _frames_to_features(snapshot=snapshot, frames=battle.commander.frames, horizon=horizon)

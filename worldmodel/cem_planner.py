@@ -358,7 +358,12 @@ def _normalized_probability(values: torch.Tensor) -> torch.Tensor:
 
 
 # MOVE 한 스텝의 최대 이동거리(유닛). devs_rollout의 next_waypoint max_step과 같아야 한다.
-MAX_MOVE_PER_STEP = 1.5
+# 1 유닛 = 10m, 1 tick = 1초이므로 1.0은 10 m/s다. 도보 보병보다 빠르지만
+# 60초 안에 400m 맵에서 기동이 일어나게 시간축을 압축한 설정이다.
+# RED 규칙 정책(red_policy 기본값)과 같은 값으로 통일한다 — 팀별로 다르면
+# 학습 데이터의 MOVE 목적지 스케일이 갈리고, 월드모델은 그 좌표를
+# "1초 뒤 위치"로 배우므로 예측이 어긋난다.
+MAX_MOVE_PER_STEP = BLUE_MAX_STEP_PER_SEC
 
 # 후보가 향할 목적. 이 비율로 뽑는다. 자유공간 균등/Gaussian 추출만 쓰면 방향이 매
 # 구간 바뀌어 유닛이 제자리를 맴돈다 — 실측(2026-08-11)에서 value head 점수와 "적까지
@@ -366,19 +371,26 @@ MAX_MOVE_PER_STEP = 1.5
 # 밀어주지 못하므로 제안 분포에서 방향을 준다.
 GOAL_WEIGHTS = (0.45, 0.35, 0.20)   # 목표 지점 / 최근접 적 / 무작위 자유점
 # 목적 지향 강도. 작을수록 직진, 클수록 탐색. 후보마다 뽑아 둘 다 나오게 한다.
-GOAL_TEMPERATURE_RANGE = (0.5, 6.0)
+# 낮을수록 목적 방향을 확정적으로 고른다. 15m 예산 안에서 가중이 힘을 쓰려면 낮아야
+# 한다 — 실측에서 (0.5,6.0)은 22m 중 4m만, (0.1,0.5)는 22m를 당겼다.
+# (실측은 1틱 예산이 15m이던 시점 값이다. 지금은 10m라 가중이 더 세게 먹는다.)
+GOAL_TEMPERATURE_RANGE = (0.1, 0.5)
 # 0이면 목적 가중을 끄고 기존 Gaussian 추출만 쓴다. 같은 코드로 켠 실험과 끈 실험을
 # 나란히 돌리기 위한 스위치다 — ablation 표가 이 스위치로 만들어진다.
 GOAL_DIRECTED = os.environ.get("CEM_GOAL_DIRECTED", "0") not in ("0", "false", "False")
-# 목적 가중을 켤 때 MOVE 목적지를 뽑는 반경 배수. 1이면 1틱 이동 예산(15m) 안에서만
+# 목적 가중을 켤 때 MOVE 목적지를 뽑는 반경 배수. 1이면 1틱 이동 예산(10m) 안에서만
 # 고르는데, 그 반경에서는 목적 쪽 끝점을 골라야 4m밖에 못 당긴다(실측). 목표까지가
 # 160m 규모라 방향 지시가 되지 않는다.
 #
 # 배수를 키우면 목적지는 "1틱에 도달할 점"이 아니라 "이쪽으로 향하라"는 지시가 된다.
-# 실행은 devs_rollout의 next_waypoint(max_step=1.5)가 15m로 잘라 주므로 안전하고,
+# 실행은 devs_rollout의 next_waypoint(max_step=MAX_MOVE_PER_STEP)가 10m로 잘라 주므로 안전하고,
 # 여러 틱에 걸쳐 그 방향으로 이동한다. step별 목적지는 그대로라 CEM의 step별
 # move_mean/std 갱신도 유지된다.
-GOAL_REACH_MULTIPLIER = float(os.environ.get("CEM_GOAL_REACH_MULTIPLIER", "4.0"))
+# 1.0이 기본이다. 넓히면 목적지가 학습 분포(1틱 예산) 밖으로 나가 월드모델이 "1초에 그만큼
+# 간다"로 오독한다 — 실측에서 배수 4는 BLUE t+3s 예측오차를 9.2 -> 17.4m로 89% 악화시켰다.
+# (RED는 액션 토큰이 없어 영향 없음: 7.1 -> 7.1m). A* 후보도 면적 제곱으로 늘어
+# 조밀한 맵에서 한 에피소드가 1시간을 넘겼다.
+GOAL_REACH_MULTIPLIER = float(os.environ.get("CEM_GOAL_REACH_MULTIPLIER", "1.0"))
 # 넓힌 반경에서 A*로 검증할 점 수 상한. 목적에 가까운 순으로 이만큼만 남긴다.
 GOAL_ASTAR_CANDIDATES = int(os.environ.get("CEM_GOAL_ASTAR_CANDIDATES", "24"))
 # 자유공간 후보점 캐시. 맵마다 largest_free_component가 비싸서 장애물 서명으로 재사용한다.

@@ -59,6 +59,7 @@ from hackerthon.worldmodel.actions import (  # noqa: E402
     unit_name,
 )
 from hackerthon.worldmodel.cem_planner import (  # noqa: E402
+    MAX_MOVE_PER_STEP,
     CEMConfig,
     CEMDistribution,
     ObservedActionWindow,
@@ -1214,6 +1215,9 @@ class CEMCommanderAtomic(AtomicDEVS):
                     # 임무 목표로 향하게 한다. 임무마다 objective 위치가 다르므로
                     # destroy 계열은 RED 진영으로, 거점 방어는 거점으로 전진한다.
                     assault_target=self.objective,
+                    # CEM replay/devs_rollout과 같은 1틱 상한. RED(1.0)와 달라야
+                    # 학습 데이터의 BLUE MOVE 목적지가 CEM 후보와 같은 스케일이 된다.
+                    max_step=MAX_MOVE_PER_STEP,
                 ).decide(observation)
             )
             command["unit_id"] = int(blue_id)
@@ -1628,14 +1632,14 @@ class CEMCommanderAtomic(AtomicDEVS):
                 target_y = _world_y_from_norm(plan.move_xy_norm[0, step_index, unit_index, 1])
                 target_x, target_y = clamp_to_world(target_x, target_y)
                 current_pos = (float(row_by_id[unit_id]["x"]), float(row_by_id[unit_id]["y"]))
-                waypoint = next_waypoint(current_pos, (target_x, target_y), self.obstacles, max_step=1.5)
+                waypoint = next_waypoint(current_pos, (target_x, target_y), self.obstacles, max_step=MAX_MOVE_PER_STEP)
                 if waypoint is None:
                     # CEM은 지형을 모른 채 목적지를 뽑으므로 건물 안이 나올 수 있다.
                     # 그때 STOP시키면 유닛이 지형이 촘촘한 맵에서 계속 멈춘다.
                     # 도달 가능한 최근접 지점으로 투영해 이동은 계속하게 한다.
                     projected = snap_to_component((target_x, target_y), self._free_component())
                     if projected is not None:
-                        waypoint = next_waypoint(current_pos, projected, self.obstacles, max_step=1.5)
+                        waypoint = next_waypoint(current_pos, projected, self.obstacles, max_step=MAX_MOVE_PER_STEP)
                 if waypoint is None:
                     commands.append({"unit_id": unit_id, "action": "STOP", "duration_sec": 1.0, "reason": f"cem move blocked|plan=MOVE|step={step_index}"})
                 else:

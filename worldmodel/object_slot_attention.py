@@ -51,7 +51,7 @@ STATIC_TERRAIN_KV = os.environ.get("CJEPA_STATIC_TERRAIN_KV", "1") not in ("0", 
 # 넘겼다. 전사자는 더 심해서 hp=0인데 6스텝에 44m를 움직였다.
 UNIT_HP_FEATURE_INDEX, UNIT_X_FEATURE_INDEX, UNIT_Y_FEATURE_INDEX = 1, 3, 4
 # 한 스텝 최대 이동(월드 유닛). cem_planner.MAX_MOVE_PER_STEP, devs next_waypoint와 같다.
-MAX_MOVE_PER_STEP_UNITS = 1.5
+MAX_MOVE_PER_STEP_UNITS = 1.0
 ENFORCE_ROLLOUT_PHYSICS = os.environ.get("CJEPA_ROLLOUT_PHYSICS", "1") not in ("0", "false", "False")
 
 # 유닛 위치를 절대 좌표가 아니라 **마지막 관측 위치로부터의 변화량**으로 예측한다.
