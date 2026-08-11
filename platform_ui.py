@@ -189,11 +189,10 @@ function unitHtml(u, px) {
   const d = Math.round(px*10)/10;
   const stale = believed && u.last_seen !== undefined && S.view
     ? Math.max(0, S.view.time - u.last_seen) : 0;
-  // 불확실 반경 = RED 최대 이동속도 x 미관측 경과 시간. 적이 그 시간 동안
-  // 도달 가능한 범위이므로, 원 밖이면 없다고 봐도 되는 경계다.
-  // 관측거리를 넘어서면 belief 자체가 의미를 잃어 거기서 자른다.
-  const radiusM = Math.min(PERCEPTION_RANGE_M, stale * RED_MAX_SPEED_MPS);
-  const halo = believed ? Math.max(16, 2 * radiusM / metersPerPixel()) : 0;
+  // 불확실 원은 뺐다. 반경이 10초면 상한(100m)에 닿아 화면을 덮고, 재생 중에는
+  // S.view.time이 결심 시각에 고정돼 안 뜨는데 결심 이력에서만 떠서 일관성도 없었다.
+  // 미관측이라는 정보는 색(주황)과 라벨의 "?Ns"가 이미 전달한다.
+  const halo = 0;
   // 추정 유닛의 점은 최소 9px. 실축척(0.7m)은 "여기 정확히 있다"는 뜻인데
   // 추정 위치엔 그 주장이 없다. 정밀도는 원이 말하고, 점은 중심만 찍는다.
   const dot = believed ? Math.max(d, MIN_BELIEVED_PX) : d;

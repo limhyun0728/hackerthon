@@ -69,6 +69,65 @@ ENFORCE_ROLLOUT_PHYSICS = os.environ.get("CJEPA_ROLLOUT_PHYSICS", "1") not in ("
 # 무시돼 위치가 전부 어긋난다.
 POSITION_RESIDUAL = os.environ.get("CJEPA_POSITION_RESIDUAL", "0") not in ("0", "false", "False")
 
+# 속성별 블록. 토큰을 통짜로 두면 위치 정보가 embedding 어디에나 중복해서 실릴 수
+# 있고, 전체의 38%를 차지하는 latent 손실이 그걸 자유롭게 회전·혼합시킨다. 실측에서
+# 위치 손실을 20% 비중까지 올려도 실제 오차가 안 내려간 이유가 이것으로 보인다.
+#
+# 인코더가 속성을 정해진 블록에 넣고 디코더가 같은 블록에서만 읽으면, EMA 타깃의
+# 블록에도 같은 속성이 들어가므로 latent 손실이 "위치 블록을 위치 블록에 맞춰라"가
+# 되어 위치 손실과 방향이 정렬된다.
+#
+# 좌표는 세 타입 모두 갖고 있어(UNIT x/y, TERRAIN x/y, MISSION objective_x/y) 위치
+# 블록만은 타입 공용 인코더를 쓴다. 그래야 유닛-건물, 유닛-목표 기하가 같은 축에서
+# 비교된다.
+#
+# transformer는 여전히 전체 차원을 섞는다. 제약은 입출력 경계에만 건다 — dynamics가
+# "hp가 0이면 안 움직인다" 같은 관계를 쓸 수 있어야 하기 때문이다.
+PROPERTY_BLOCKS = os.environ.get("CJEPA_PROPERTY_BLOCKS", "0") not in ("0", "false", "False")
+
+# embedding_dim을 이 비율로 나눠 블록을 만든다. 합이 1이 아니면 나머지는 정체 블록에
+# 붙는다. 위치에 가장 큰 몫을 준다 — 우리가 못 맞히고 있는 축이고, 세 타입이 공유한다.
+BLOCK_RATIO = {"position": 0.375, "state": 0.25, "heading": 0.125}
+
+# 타입별로 어느 feature가 어느 블록에 들어가는지. 인코더/디코더가 같은 표를 쓴다.
+BLOCK_FEATURE_INDEX: Mapping[int, Mapping[str, tuple[int, ...]]] = {
+    int(ObjectType.UNIT): {
+        "position": (3, 4),          # x_norm, y_norm
+        "state": (1, 2, 7),          # hp_ratio, ammo_ratio, alive
+        "heading": (5, 6),           # heading_cos, heading_sin
+        "identity": (0,),            # team
+    },
+    int(ObjectType.TERRAIN): {
+        "position": (1, 2),          # x_norm, y_norm
+        "state": (5, 6, 7, 8),       # traversability, movement_cost, cover_value, los_block
+        "heading": (),
+        "identity": (0, 3, 4),       # terrain_type, width_norm, height_norm
+    },
+    int(ObjectType.MISSION): {
+        "position": (1, 2),          # objective_x_norm, objective_y_norm
+        "state": (3, 4),             # time_remaining_ratio, completion_flag
+        "heading": (),
+        "identity": (0,),            # mission_type
+    },
+}
+
+
+def block_layout(embedding_dim: int) -> dict[str, slice]:
+    """embedding을 속성 블록 slice로 나눈다. 나머지는 identity가 흡수한다."""
+    if embedding_dim <= 0:
+        raise ValueError("embedding_dim은 0보다 커야 한다")
+    sizes = {name: max(1, int(embedding_dim * ratio)) for name, ratio in BLOCK_RATIO.items()}
+    used = sum(sizes.values())
+    if used >= embedding_dim:
+        raise ValueError(f"블록 합({used})이 embedding_dim({embedding_dim}) 이상이다")
+    sizes["identity"] = embedding_dim - used
+    layout: dict[str, slice] = {}
+    start = 0
+    for name in ("position", "state", "heading", "identity"):
+        layout[name] = slice(start, start + sizes[name])
+        start += sizes[name]
+    return layout
+
 
 TEAM_EMBEDDING_INDEX: Mapping[int, int] = {
     int(TeamId.NONE): 0,
@@ -321,6 +380,173 @@ def select_cjepa_masked_slots(
     masked_slot_mask = torch.zeros((batch_size, num_slots), dtype=torch.bool, device=type_ids.device)
     masked_slot_mask[:, masked_indices] = True
     return masked_slot_mask, masked_indices
+
+
+class BlockObjectSlotEncoder(nn.Module):
+    """속성별 블록으로 나눠 인코딩한다. 위치 블록은 타입 공용이다.
+
+    타입별 통짜 MLP(8 -> 128)와 달리, 각 속성을 자기 블록에만 쓴다. 위치는 세 타입이
+    같은 인코더를 공유하므로 유닛/건물/목표의 좌표가 embedding의 같은 축에 놓인다.
+    """
+
+    def __init__(self, config: ObjectSlotModelConfig):
+        super().__init__()
+        dim = config.embedding_dim
+        hidden = config.hidden_dim
+        self.layout = block_layout(dim)
+        self.position_encoder = _mlp(2, hidden, self.layout["position"].stop - self.layout["position"].start,
+                                     config.dropout)
+        state_dim = self.layout["state"].stop - self.layout["state"].start
+        heading_dim = self.layout["heading"].stop - self.layout["heading"].start
+        self.state_encoders = nn.ModuleDict()
+        for type_id, spec in BLOCK_FEATURE_INDEX.items():
+            if spec["state"]:
+                self.state_encoders[str(type_id)] = _mlp(len(spec["state"]), hidden, state_dim, config.dropout)
+        self.heading_encoder = _mlp(2, hidden, heading_dim, config.dropout)
+        # 방향이 없는 타입(지형·임무)은 학습된 상수로 채운다. 0으로 두면 그 축이
+        # 죽은 채로 attention에 들어가 타입 구분이 흐려진다.
+        self.heading_default = nn.Parameter(torch.zeros(heading_dim))
+        identity_dim = self.layout["identity"].stop - self.layout["identity"].start
+        self.type_embedding = nn.Embedding(len(ObjectType), identity_dim)
+        self.team_embedding = nn.Embedding(len(TEAM_EMBEDDING_INDEX), identity_dim)
+        self.identity_encoders = nn.ModuleDict()
+        for type_id, spec in BLOCK_FEATURE_INDEX.items():
+            if spec["identity"]:
+                self.identity_encoders[str(type_id)] = _mlp(
+                    len(spec["identity"]), hidden, identity_dim, config.dropout
+                )
+        # 정규화도 블록별로 건다. 전체 차원에 LayerNorm을 걸면 평균·분산이 모든 블록에
+        # 걸쳐 계산되어 블록이 다시 섞이고, 입력 쪽 고정이 무의미해진다. 검증에서
+        # hp만 바꿨는데 position 블록이 0.46 움직이는 것으로 확인했다.
+        self.embedding_dim = dim
+        self.block_norms = nn.ModuleDict(
+            {name: nn.LayerNorm(sl.stop - sl.start) for name, sl in self.layout.items()}
+        )
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        feature_mask: torch.Tensor,
+        type_ids: torch.Tensor,
+        team_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """object feature를 속성 블록에 배치한 token으로 만든다."""
+        _expect_rank("features", features, 3)
+        _expect_rank("type_ids", type_ids, 2)
+        _expect_bool("feature_mask", feature_mask)
+        if features.shape[:2] != type_ids.shape or type_ids.shape != team_ids.shape:
+            raise ValueError("features/type_ids/team_ids의 batch, slot 차원이 같아야 한다")
+        _ensure_known_type_ids(type_ids)
+
+        batch_size, num_slots, _ = features.shape
+        token = features.new_zeros((batch_size, num_slots, self.embedding_dim))
+        heading_slice = self.layout["heading"]
+        token[..., heading_slice] = self.heading_default
+
+        team_index = _team_embedding_indices(team_ids)
+        identity_slice = self.layout["identity"]
+        token[..., identity_slice] = (
+            self.type_embedding(type_ids.long()) + self.team_embedding(team_index)
+        )
+
+        for type_id, spec in BLOCK_FEATURE_INDEX.items():
+            selected = type_ids == int(type_id)
+            if not bool(torch.any(selected)):
+                continue
+            chosen = features[selected]
+            # 디코더와 같은 이유로 mask 인덱싱과 블록 slice를 분리한다.
+            block = token[selected]
+            block[:, self.layout["position"]] = self.position_encoder(
+                chosen[:, list(spec["position"])]
+            )
+            if spec["state"]:
+                block[:, self.layout["state"]] = self.state_encoders[str(type_id)](
+                    chosen[:, list(spec["state"])]
+                )
+            if spec["heading"]:
+                block[:, heading_slice] = self.heading_encoder(chosen[:, list(spec["heading"])])
+            if spec["identity"]:
+                block[:, identity_slice] = block[:, identity_slice] + (
+                    self.identity_encoders[str(type_id)](chosen[:, list(spec["identity"])])
+                )
+            token[selected] = block
+        # 블록마다 따로 정규화해야 블록 간 독립이 유지된다.
+        parts = [self.block_norms[name](token[..., sl]) for name, sl in self.layout.items()]
+        return torch.cat(parts, dim=-1)
+
+
+class BlockObjectStateDecoder(nn.Module):
+    """각 속성을 자기 블록에서만 읽어 feature로 되돌린다."""
+
+    def __init__(self, config: ObjectSlotModelConfig):
+        super().__init__()
+        dim = config.embedding_dim
+        hidden = config.hidden_dim
+        self.layout = block_layout(dim)
+        self.position_decoder = _mlp(
+            self.layout["position"].stop - self.layout["position"].start, hidden, 2, config.dropout
+        )
+        self.heading_decoder = _mlp(
+            self.layout["heading"].stop - self.layout["heading"].start, hidden, 2, config.dropout
+        )
+        self.state_decoders = nn.ModuleDict()
+        self.identity_decoders = nn.ModuleDict()
+        for type_id, spec in BLOCK_FEATURE_INDEX.items():
+            if spec["state"]:
+                self.state_decoders[str(type_id)] = _mlp(
+                    self.layout["state"].stop - self.layout["state"].start, hidden,
+                    len(spec["state"]), config.dropout,
+                )
+            if spec["identity"]:
+                self.identity_decoders[str(type_id)] = _mlp(
+                    self.layout["identity"].stop - self.layout["identity"].start, hidden,
+                    len(spec["identity"]), config.dropout,
+                )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        type_ids: torch.Tensor,
+        *,
+        only_types: tuple[ObjectType, ...] | None = None,
+    ) -> torch.Tensor:
+        """`only_types`를 주면 그 타입만 디코딩하고 나머지 slot은 0으로 남긴다."""
+        _expect_rank("tokens", tokens, 3)
+        _expect_rank("type_ids", type_ids, 2)
+        if tokens.shape[:2] != type_ids.shape:
+            raise ValueError("tokens와 type_ids의 batch, slot 차원이 같아야 한다")
+        _ensure_known_type_ids(type_ids)
+
+        batch_size, num_slots, _ = tokens.shape
+        decoded = tokens.new_zeros((batch_size, num_slots, MAX_FEATURE_DIM))
+        for type_id, spec in BLOCK_FEATURE_INDEX.items():
+            if only_types is not None and ObjectType(type_id) not in only_types:
+                continue
+            selected = type_ids == int(type_id)
+            if not bool(torch.any(selected)):
+                continue
+            chosen = tokens[selected]
+            # bool mask와 feature index를 한 번에 쓰면 브로드캐스트가 깨진다
+            # (shape [N], [N], [2]). mask로 뽑은 (N, MAX_FEATURE_DIM) 버퍼를 채운 뒤
+            # 통째로 되돌려 넣는다.
+            filled = decoded.new_zeros((chosen.shape[0], MAX_FEATURE_DIM))
+            filled[:, list(spec["position"])] = self.position_decoder(
+                chosen[:, self.layout["position"]]
+            )
+            if spec["state"]:
+                filled[:, list(spec["state"])] = self.state_decoders[str(type_id)](
+                    chosen[:, self.layout["state"]]
+                )
+            if spec["heading"]:
+                filled[:, list(spec["heading"])] = self.heading_decoder(
+                    chosen[:, self.layout["heading"]]
+                )
+            if spec["identity"]:
+                filled[:, list(spec["identity"])] = self.identity_decoders[str(type_id)](
+                    chosen[:, self.layout["identity"]]
+                )
+            decoded[selected] = filled
+        return decoded
 
 
 class TypedObjectSlotEncoder(nn.Module):
@@ -1404,7 +1630,10 @@ class DEVSObjectCentricWorldModel(nn.Module):
         super().__init__()
         self.config = config
         dim = self.config.embedding_dim
-        self.slot_encoder = TypedObjectSlotEncoder(self.config)
+        self.slot_encoder = (
+            BlockObjectSlotEncoder(self.config) if PROPERTY_BLOCKS
+            else TypedObjectSlotEncoder(self.config)
+        )
         # action 전 context self-attention은 쓰지 않는다. slot_encoder는 객체별
         # raw DEVS feature를 같은 latent 공간으로 올리는 projection만 담당한다.
         # JEPA target용 EMA projection encoder. online encoder가 target을 함께
@@ -1427,12 +1656,19 @@ class DEVSObjectCentricWorldModel(nn.Module):
         # 유닛 위치 변화량(Δx, Δy) 전용 head. 마지막 층을 0으로 두어 학습 시작 시점의
         # 예측이 정확히 "마지막 관측 위치 그대로"가 되게 한다. 실측 정지 가정 오차
         # (RED t+1s 3.9m)에서 출발하므로, 현재 절대 좌표 예측(9.6m)보다 이미 낫다.
-        self.unit_position_delta = _mlp(dim, self.config.hidden_dim, 2, self.config.dropout)
+        # 블록을 쓰면 delta head도 위치 블록만 읽는다. 인코더·디코더와 같은 규약이라야
+        # "위치는 이 블록에 산다"가 파이프라인 전체에서 일관된다.
+        self._position_slice = block_layout(dim)["position"] if PROPERTY_BLOCKS else slice(0, dim)
+        delta_input_dim = self._position_slice.stop - self._position_slice.start
+        self.unit_position_delta = _mlp(delta_input_dim, self.config.hidden_dim, 2, self.config.dropout)
         final_delta_layer = self.unit_position_delta[-1]
         nn.init.zeros_(final_delta_layer.weight)
         nn.init.zeros_(final_delta_layer.bias)
         self.masked_predictor = CausalMaskedObjectPredictor(self.config)
-        self.state_decoder = ObjectStateDecoder(self.config)
+        self.state_decoder = (
+            BlockObjectStateDecoder(self.config) if PROPERTY_BLOCKS
+            else ObjectStateDecoder(self.config)
+        )
         self.self_state_decoder = SlotSelfStateDecoder(self.config)
 
     def encode_state(
@@ -1729,7 +1965,9 @@ class DEVSObjectCentricWorldModel(nn.Module):
             # 겪은 것과 같은 종류의 조용한 불일치가 된다.
             future_updated = _apply_position_residual(
                 pred_features[:, history_frames:total_frames],
-                delta=self.unit_position_delta(pred_tokens[:, history_frames:total_frames]),
+                delta=self.unit_position_delta(
+                    pred_tokens[:, history_frames:total_frames, :, self._position_slice]
+                ),
                 last_observed=features[:, history_frames - 1],
                 type_ids=type_ids[:, 0].unsqueeze(1).expand(
                     type_ids.shape[0], self.config.pred_frames, type_ids.shape[2]
@@ -1868,7 +2106,7 @@ class DEVSObjectCentricWorldModel(nn.Module):
         if POSITION_RESIDUAL:
             future_features = _apply_position_residual(
                 future_features,
-                delta=self.unit_position_delta(future_tokens),
+                delta=self.unit_position_delta(future_tokens[..., self._position_slice]),
                 last_observed=history_features[:, -1],
                 type_ids=future_type_ids,
             )

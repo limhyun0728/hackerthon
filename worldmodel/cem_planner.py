@@ -359,6 +359,28 @@ def _normalized_probability(values: torch.Tensor) -> torch.Tensor:
 
 # MOVE 한 스텝의 최대 이동거리(유닛). devs_rollout의 next_waypoint max_step과 같아야 한다.
 MAX_MOVE_PER_STEP = 1.5
+
+# 후보가 향할 목적. 이 비율로 뽑는다. 자유공간 균등/Gaussian 추출만 쓰면 방향이 매
+# 구간 바뀌어 유닛이 제자리를 맴돈다 — 실측(2026-08-11)에서 value head 점수와 "적까지
+# 거리"의 상관이 -0.21, "목표까지 거리"는 +0.12로 **부호가 반대**였다. 채점이 접근을
+# 밀어주지 못하므로 제안 분포에서 방향을 준다.
+GOAL_WEIGHTS = (0.45, 0.35, 0.20)   # 목표 지점 / 최근접 적 / 무작위 자유점
+# 목적 지향 강도. 작을수록 직진, 클수록 탐색. 후보마다 뽑아 둘 다 나오게 한다.
+GOAL_TEMPERATURE_RANGE = (0.5, 6.0)
+# 0이면 목적 가중을 끄고 기존 Gaussian 추출만 쓴다. 같은 코드로 켠 실험과 끈 실험을
+# 나란히 돌리기 위한 스위치다 — ablation 표가 이 스위치로 만들어진다.
+GOAL_DIRECTED = os.environ.get("CEM_GOAL_DIRECTED", "0") not in ("0", "false", "False")
+# 목적 가중을 켤 때 MOVE 목적지를 뽑는 반경 배수. 1이면 1틱 이동 예산(15m) 안에서만
+# 고르는데, 그 반경에서는 목적 쪽 끝점을 골라야 4m밖에 못 당긴다(실측). 목표까지가
+# 160m 규모라 방향 지시가 되지 않는다.
+#
+# 배수를 키우면 목적지는 "1틱에 도달할 점"이 아니라 "이쪽으로 향하라"는 지시가 된다.
+# 실행은 devs_rollout의 next_waypoint(max_step=1.5)가 15m로 잘라 주므로 안전하고,
+# 여러 틱에 걸쳐 그 방향으로 이동한다. step별 목적지는 그대로라 CEM의 step별
+# move_mean/std 갱신도 유지된다.
+GOAL_REACH_MULTIPLIER = float(os.environ.get("CEM_GOAL_REACH_MULTIPLIER", "4.0"))
+# 넓힌 반경에서 A*로 검증할 점 수 상한. 목적에 가까운 순으로 이만큼만 남긴다.
+GOAL_ASTAR_CANDIDATES = int(os.environ.get("CEM_GOAL_ASTAR_CANDIDATES", "24"))
 # 자유공간 후보점 캐시. 맵마다 largest_free_component가 비싸서 장애물 서명으로 재사용한다.
 _FREE_POINT_CACHE: dict[tuple, np.ndarray] = {}
 
@@ -540,6 +562,8 @@ def _sample_free_within(
     move_mean: torch.Tensor,
     move_std: torch.Tensor,
     generator: torch.Generator,
+    goal: torch.Tensor | None = None,
+    temperature: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """A*로 도달 가능한 자유공간 중 CEM MOVE Gaussian에 따라 목적지를 샘플링한다.
 
@@ -553,6 +577,18 @@ def _sample_free_within(
     # 실제 경로 길이는 유클리드 거리보다 짧을 수 없으므로 먼저 싸게 후보를 줄인다.
     distance = torch.cdist(flat_anchor, free_tensor)  # (N, M), 유클리드 하한
     euclidean_within = distance <= flat_budget.unsqueeze(1)
+    # A*는 유클리드 통과 점마다 한 번씩 도는데, 목적 반경을 넓히면 원 면적이 제곱으로
+    # 커져 그대로는 감당이 안 된다(배수 4에서 10분 초과). 목적 가중을 A* **이전에**
+    # 적용해 목적에 가까운 점만 남긴 뒤 검증한다. 어차피 softmax가 그쪽을 뽑으므로
+    # 결과 분포는 거의 같고 비용만 준다.
+    if GOAL_DIRECTED and goal is not None and euclidean_within.any():
+        to_goal_pre = torch.cdist(goal.reshape(-1, 2), free_tensor)
+        keep = min(GOAL_ASTAR_CANDIDATES, free_tensor.shape[0])
+        masked = to_goal_pre.masked_fill(~euclidean_within, float("inf"))
+        nearest_to_goal = masked.topk(keep, dim=1, largest=False).indices
+        pruned = torch.zeros_like(euclidean_within)
+        pruned.scatter_(1, nearest_to_goal, True)
+        euclidean_within = euclidean_within & pruned
     within = _astar_reachable_mask(
         anchors=flat_anchor,
         budgets=flat_budget,
@@ -593,6 +629,13 @@ def _sample_free_within(
     # 각 free-space 점의 diagonal Gaussian log-likelihood.
     delta = (free_norm.unsqueeze(0) - mean.unsqueeze(1)) / std.unsqueeze(1)
     logits = -0.5 * torch.square(delta).sum(dim=-1)
+    # 목적 가중. 목적까지 거리에 exp(-d/tau)를 곱하는 것과 같다. tau가 작으면 직진,
+    # 크면 탐색이라 후보마다 성격이 갈린다. Gaussian 항과 더해지므로 CEM이 elite로
+    # 분포를 좁히는 동작은 그대로 살아 있다.
+    if GOAL_DIRECTED and goal is not None and temperature is not None:
+        to_goal = torch.cdist(goal.reshape(-1, 2), free_tensor)
+        tau = temperature.reshape(-1, 1).clamp_min(1e-3)
+        logits = logits - to_goal / tau
     logits = logits.masked_fill(~within, float("-inf"))
 
     probs = torch.softmax(logits, dim=-1)
@@ -601,6 +644,20 @@ def _sample_free_within(
     if missing_rows.numel() > 0:
         picked_points[missing_rows] = flat_anchor.index_select(0, missing_rows)
     return picked_points.reshape(anchor.shape)
+
+
+def _objective_world_xy(current_batch: SlotBatch, *, device: torch.device) -> torch.Tensor:
+    """mission slot에서 목표 지점의 월드 좌표를 읽는다."""
+    features = _batch_tensor(current_batch, "features", device=device).float()
+    index = _mission_index(current_batch, device=device)
+    return torch.stack(
+        [
+            (features[index, MISSION_OBJECTIVE_X_INDEX] + 1.0) * 0.5
+            * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
+            (features[index, MISSION_OBJECTIVE_Y_INDEX] + 1.0) * 0.5
+            * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
+        ]
+    )
 
 
 def _sample_reachable_move_targets(
@@ -656,8 +713,49 @@ def _sample_reachable_move_targets(
         device=device,
     )
 
+    # 후보마다 목적 하나와 지향 강도를 뽑는다. 같은 후보 안에서는 6스텝 내내 방향이
+    # 일관되고, 후보 사이에서는 갈린다. 그래야 "한 목적을 향해 나아가는 6초"가 되고
+    # 무작위 방향으로 6초를 밀어붙이는 일이 없어진다.
+    goal = temperature = None
+    if GOAL_DIRECTED:
+        goal_probs = torch.tensor(GOAL_WEIGHTS, dtype=torch.float32, device=device)
+        goal_kind = torch.multinomial(
+            goal_probs.expand(candidates, len(GOAL_WEIGHTS)), 1, generator=generator
+        ).squeeze(-1)
+        low, high = GOAL_TEMPERATURE_RANGE
+        temperature = low + (high - low) * torch.rand(
+            (candidates,), generator=generator, device=device
+        )
+        temperature = temperature.reshape(-1, 1).expand(candidates, num_units)
+
+        objective_xy = _objective_world_xy(current_batch, device=device)
+        goal = objective_xy.reshape(1, 1, 2).expand(candidates, num_units, 2).clone()
+        _, red_norm = red_target_table(current_batch, device=device)
+        if red_norm.numel() > 0:
+            red_xy = torch.stack(
+                [
+                    (red_norm[:, 0] + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN,
+                    (red_norm[:, 1] + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN,
+                ],
+                dim=-1,
+            )
+            nearest = red_xy[torch.cdist(start, red_xy).argmin(dim=1)]
+            goal[goal_kind == 1] = nearest.reshape(1, num_units, 2).expand(
+                candidates, num_units, 2
+            )[goal_kind == 1]
+        scatter = free_tensor.index_select(
+            0,
+            torch.randint(
+                0, free_tensor.shape[0], (candidates * num_units,),
+                generator=generator, device=device,
+            ),
+        ).reshape(candidates, num_units, 2)
+        goal[goal_kind == 2] = scatter[goal_kind == 2]
+
+    # 목적 가중을 쓸 때만 반경을 넓힌다. 끄면 이전과 완전히 같은 1틱 예산이다.
+    reach = float(MAX_MOVE_PER_STEP) * (GOAL_REACH_MULTIPLIER if GOAL_DIRECTED else 1.0)
     for step in range(horizon):
-        budget = is_move[:, step].float() * float(MAX_MOVE_PER_STEP)
+        budget = is_move[:, step].float() * reach
 
         step_move_mean = (
             distribution.move_mean[step]
@@ -678,6 +776,8 @@ def _sample_reachable_move_targets(
             step_move_mean,
             step_move_std,
             generator,
+            goal=goal,
+            temperature=temperature,
         )
 
         move_now = is_move[:, step].unsqueeze(-1)

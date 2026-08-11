@@ -150,6 +150,7 @@ def measure(
     horizon: int,
     seed: int,
     device: torch.device,
+    red_target_priority: str = "nearest",
 ) -> dict[str, np.ndarray]:
     model, model_config = _load_model(checkpoint, device)
     print(f"모델 {checkpoint.name} history={model_config.history_frames} pred={model_config.pred_frames}")
@@ -253,7 +254,8 @@ def measure(
             mission_type=1,
         )
         truth = rollout_plans_with_devs(
-            plans=plans, snapshot=snapshot, seed=seed + done, device=device
+            plans=plans, snapshot=snapshot, seed=seed + done, device=device,
+            red_target_priority=red_target_priority,
         ).detach().cpu().numpy()
 
         unit_index = np.flatnonzero(batch.type_ids == int(ObjectType.UNIT))
@@ -362,6 +364,12 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", type=str, default="cuda:2")
+    parser.add_argument(
+        "--red-target-priority",
+        choices=("nearest", "low_hp", "smart"),
+        default="nearest",
+        help="평가용 RED 정책. 학습은 nearest로 했으므로 다른 값을 주면 상대 정책 일반화를 잰다",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -386,6 +394,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         horizon=args.horizon,
         seed=args.seed,
         device=torch.device(args.device),
+        red_target_priority=args.red_target_priority,
     )
     hit, total, errors = result["hit"], result["total"], result["errors"]
 

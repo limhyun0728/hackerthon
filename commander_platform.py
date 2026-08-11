@@ -558,6 +558,70 @@ def _build_path(
     return path
 
 
+def _merge_belief_path(
+    true_path: list[dict[str, Any]],
+    predicted_path: list[dict[str, Any]],
+    obstacles,
+    belief_start: list[dict[str, Any]],
+    base_time: float,
+) -> list[dict[str, Any]]:
+    """프레임마다 관측된 것은 실측, 미관측 RED는 예측으로 합친다.
+
+    지휘관이 실제로 볼 수 있는 화면이다. BLUE와 관측된 RED는 DEVS가 굴린 진짜
+    상태이고, 못 보는 RED는 월드모델 예측 위치로 계속 움직인다. 마지막 관측 자리에
+    고정하지 않는 이유는, 적이 실제로는 움직이고 있고 그 추정이 다음 결심의 입력이
+    되기 때문이다.
+
+    관측 판정은 **실측 좌표**로 한다. 보이느냐 마느냐는 적이 실제로 어디 있느냐로
+    정해지지, 우리가 어디 있다고 믿느냐로 정해지지 않는다.
+
+    hp/ammo는 미관측이면 동결한다. 관측 조건과 사격 조건이 같아서(거리 + LOS)
+    안 보이는 적은 BLUE와 총알을 주고받을 수 없다.
+    """
+    last_seen = {
+        int(r["id"]): float(r.get("last_seen", base_time))
+        for r in belief_start
+        if int(r["id"]) >= 200
+    }
+    held = {
+        int(r["id"]): (float(r["hp"]), int(r["ammo"]))
+        for r in belief_start
+        if int(r["id"]) >= 200
+    }
+    merged: list[dict[str, Any]] = []
+    for step, true_frame in enumerate(true_path):
+        time_sec = base_time + step + 1
+        true_rows = {int(r["id"]): r for r in true_frame["units"]}
+        predicted = {}
+        if step < len(predicted_path):
+            predicted = {int(r["id"]): r for r in predicted_path[step]["units"]}
+        observed = _observed_red_ids(list(true_rows.values()), obstacles)
+
+        rows: list[dict[str, Any]] = []
+        for unit_id, true_row in true_rows.items():
+            if unit_id < 200:
+                rows.append(dict(true_row))          # BLUE는 항상 실측
+                continue
+            if unit_id in observed or true_row["hp"] <= 0.0:
+                entry = dict(true_row)
+                entry["observed"] = True
+                last_seen[unit_id] = time_sec
+                held[unit_id] = (float(true_row["hp"]), int(true_row["ammo"]))
+            else:
+                source = predicted.get(unit_id) or true_row
+                entry = dict(source)
+                entry["id"] = unit_id
+                entry["observed"] = False
+                hp, ammo = held.get(unit_id, (float(true_row["hp"]), int(true_row["ammo"])))
+                entry["hp"], entry["ammo"] = hp, ammo
+            entry["time"] = time_sec
+            entry["last_seen"] = last_seen.get(unit_id, time_sec)
+            rows.append(entry)
+        # 사격선은 실측을 쓴다. 쏘려면 보여야 하므로 미관측 적과의 사격선은 없다.
+        merged.append({"units": rows, "fire": true_frame["fire"]})
+    return merged
+
+
 def _formation_spread(rows: list[dict[str, Any]], only_ids: set[int] | None = None) -> float:
     """BLUE 유닛 간 평균 쌍거리. only_ids를 주면 그 유닛들만 쓴다."""
     pts = [
@@ -987,10 +1051,25 @@ class PlatformState:
         """
         session = self.sessions[session_id]
         node = session.current
+        # belief(계획 입력)와 실제 상태(DEVS 시작점)를 나눠서 들고 간다. 지휘관은
+        # 미관측 적의 진짜 위치를 모르므로, DEVS 결과를 그대로 다음 결심의 입력으로
+        # 쓰면 알 수 없는 정보가 계획에 새어 들어간다. select()가 _update_belief로
+        # 하는 것과 같은 처리를 여기서도 해야 한다.
         rows = [dict(r) for r in node.unit_rows]
+        true_state = [dict(r) for r in (node.true_rows or node.unit_rows)]
+        # 이 함수는 가정 전개라 세션의 belief를 건드리면 안 된다. 끝나면 되돌린다.
+        saved_belief = {k: dict(v) for k, v in session.red_belief.items()}
         time_sec = node.time_sec
-        # 추천 시나리오는 지휘관이 눈으로 보는 기준안이라 물리가 맞아야 한다.
-        # 월드모델 예측은 건물 통과·순간이동이 섞이므로 기본은 DEVS로 정확히 굴린다.
+        # **고를 때는 예측, 보여줄 때는 실측**이다.
+        #
+        # 후보 채점은 월드모델로 한다 — 그게 planning이고, 빨라서 후보를 많이 볼 수 있다.
+        # 하지만 화면에 그리고 다음 구간으로 이어붙이는 것은 고른 plan 하나를 DEVS로
+        # 다시 굴린 결과다. 예측을 그대로 이어붙이면 60초 동안 예측 위에 예측을 10번
+        # 쌓게 되고, 실측(2026-08-11)에서 모델은 후보 간 RED 위치 변화를 실제 0.31m
+        # 대비 3.05m로, HP 변화를 4.13 대비 17.06으로 지어낸다. 일어나지 않는 적
+        # 반응을 지휘관에게 보여주게 된다.
+        #
+        # 비용은 구간당 DEVS rollout 1회다. 후보 전부를 DEVS로 굴리는 것보다 훨씬 싸다.
         use_model = self.model if self.recommend_backend == "model" else None
         num = candidates or self.recommend_candidates
 
@@ -1013,6 +1092,9 @@ class PlatformState:
                     device=self.device, model=use_model, model_config=self.model_config,
                     value_head=self.value_head, iterations=self.archive_iterations,
                 )
+                # cells에는 plan이 없다(표시용 요약만 담는다). DEVS로 다시 굴리려면
+                # plan이 필요하므로 pending이 지워지기 전에 집어 둔다.
+                entries = dict(session.pending.get("archive") or {})
             finally:
                 session.nodes, session.current_id = saved_nodes, saved_id
                 session.pending = {}
@@ -1020,7 +1102,21 @@ class PlatformState:
             if not cells:
                 break
             best = max(cells, key=lambda c: c["score"])
-            for step, frame in enumerate(best["path"]):
+
+            # 고른 plan 하나를 DEVS로 굴려 실제 전개를 얻는다. probe의 true_rows를
+            # 직전 구간의 DEVS 결과로 두므로 구간마다 실측으로 접지된다.
+            entry = entries.get((best["engage_bin"], best["spread_bin"]))
+            probe.true_rows = true_state
+            if entry is None:
+                true_rows, true_path = [dict(r) for r in best["rows"]], best["path"]
+            else:
+                true_rows, true_path = self._advance_true(session, probe, entry)
+
+            # 관측된 것은 실측, 미관측 RED는 같은 plan의 월드모델 예측으로 합친다.
+            belief_path = _merge_belief_path(
+                true_path, best["path"], session.obstacles, rows, time_sec
+            )
+            for step, frame in enumerate(belief_path):
                 frames.append(
                     {
                         "time": time_sec + step + 1,
@@ -1028,19 +1124,25 @@ class PlatformState:
                         "fire": frame["fire"],
                     }
                 )
+            # 요약도 예측이 아니라 실제 결과로 낸다. 지휘관이 읽는 "끝나면 몇 대 몇"이
+            # 화면의 궤적과 어긋나면 안 된다.
             picks.append(
                 {
                     "time": time_sec,
                     "label": best["label"],
                     "score": best["score"],
-                    "blue_alive": best["blue_alive"],
-                    "red_alive": best["red_alive"],
-                    "blue_hp": best["blue_hp"],
-                    "red_hp": best["red_hp"],
+                    "blue_alive": sum(1 for r in true_rows if r["id"] < 200 and r["hp"] > 0.0),
+                    "red_alive": sum(1 for r in true_rows if r["id"] >= 200 and r["hp"] > 0.0),
+                    "blue_hp": sum(max(r["hp"], 0.0) for r in true_rows if r["id"] < 200),
+                    "red_hp": sum(max(r["hp"], 0.0) for r in true_rows if r["id"] >= 200),
                 }
             )
-            rows = [dict(r) for r in best["rows"]]
+            # 화면에는 실제 전개를 그리되, 다음 결심의 계획 입력은 belief로 만든다.
+            true_state = [dict(r) for r in true_rows]
+            # 다음 결심의 계획 입력. 화면과 같은 belief여야 지휘관이 본 것과 계획이 맞는다.
+            rows = [dict(r) for r in belief_path[-1]["units"]] if belief_path else true_state
             time_sec += session.horizon
+        session.red_belief = saved_belief
         return {"frames": frames, "picks": picks, "objective": list(session.objective)}
 
     def select(self, session_id: str, engage_bin: int, spread_bin: int) -> dict[str, Any]:
