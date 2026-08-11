@@ -1,0 +1,1332 @@
+diff --git a/commander_platform.py b/commander_platform.py
+index e70a103..ceca8d2 100644
+--- a/commander_platform.py
++++ b/commander_platform.py
+@@ -61,6 +61,7 @@ from hackerthon.worldmodel.cem_planner import (
+     rollout_with_world_model,
+     sample_future_action_plans,
+     score_future_features_torch,
++    update_distribution,
+ )
+ from hackerthon.worldmodel.object_slot_attention import (
+     DEVSObjectCentricWorldModel,
+@@ -76,7 +77,10 @@ from hackerthon.worldmodel.slots import (
+     ObjectType,
+     TeamId,
+     build_slot_batch,
++    mission_type_from_config,
+ )
++from hackerthon.worldmodel.value_head import load_value_head
++from hackerthon.worldmodel.value_scoring import make_value_score_fn
+ 
+ try:
+     from local_env import load_local_env
+@@ -137,6 +141,12 @@ class TreeNode:
+     true_rows: list[dict[str, Any]] | None = None   # 실제 전장 상태 (사후 대조용)
+     chosen_label: str | None = None
+     children: list[str] = field(default_factory=list)
++    # 이 노드 시점의 RED belief. 세션 전역으로 두면 결심 이력을 되돌려도 나중에 알게 된
++    # 위치와 last_seen이 남아, 그 시점에 몰랐던 정보가 화면에 보인다.
++    red_belief: dict[int, dict[str, Any]] = field(default_factory=dict)
++    # 부모에서 여기까지 실제로 벌어진 6프레임. 후보 미리보기는 예측이지만 확정된
++    # 구간은 DEVS 결과가 있으므로 그걸 남긴다. _advance_true가 어차피 계산한다.
++    true_path: list[dict[str, Any]] = field(default_factory=list)
+ 
+ 
+ @dataclass
+@@ -420,6 +430,13 @@ def _update_belief(
+             entry["last_seen"] = float(
+                 (session.red_belief.get(unit_id) or {}).get("last_seen", time_sec)
+             )
++            # 안 보이는 적은 위치만 예측으로 잇고 hp/ammo는 마지막 관측값에 묶는다.
++            # 관측 판정과 사격 판정이 같은 조건(거리 MAX_FIRE_RANGE + LOS)이므로
++            # 미관측 적은 BLUE의 사격을 받을 수도, BLUE를 쏠 수도 없다. 예측값을
++            # 그대로 쓰면 멀쩡히 살아 있는 적이 belief에서 전사로 표시된다.
++            last = session.red_belief.get(unit_id) or row
++            entry["hp"] = float(last["hp"])
++            entry["ammo"] = int(last["ammo"])
+         entry["time"] = time_sec
+         session.red_belief[unit_id] = entry
+         belief.append(entry)
+@@ -482,6 +499,11 @@ def _build_path(
+ 
+     판정은 예측 좌표 위에서 한다. 이 경로는 아직 일어나지 않은 일이므로
+     "이대로 가면 이 시점엔 보일 것이다"가 지휘관에게 맞는 정보다.
++
++    RED의 hp/ammo는 관측된 프레임에서만 줄어들 수 있다. 사격 판정과 관측 판정이
++    같은 조건이라 미관측 적은 BLUE와 총알을 주고받을 수 없는데, 월드모델은 그걸
++    모르고 안 보이는 적을 죽여 놓는다. 그대로 두면 모든 전개안이 적을 잡은 것처럼
++    보이고, 그 상태가 다음 세그먼트 시작값으로 이어져 시나리오 끝까지 간다.
+     """
+     # 세그먼트 시작 시점의 last_seen을 이어받는다. 이전 결심에서 이미 놓친
+     # 적은 재생 첫 프레임부터 그만큼 불확실한 상태로 시작해야 한다.
+@@ -490,15 +512,39 @@ def _build_path(
+         for r in (belief_start or [])
+         if int(r["id"]) >= 200
+     }
++    # 미관측 구간에서 동결할 기준값. 없으면 첫 프레임 예측값으로 채워진다.
++    held = {
++        int(r["id"]): (float(r["hp"]), int(r["ammo"]))
++        for r in (belief_start or [])
++        if int(r["id"]) >= 200
++    }
+     path = []
+     for step in range(features.shape[0]):
+         time_sec = base_time + step + 1
+         rows = _rows_from_features(batch, features[step], time_sec)
++
++        # 관측 판정 전에 hp를 직전 값으로 되돌려 둔다. 모델이 미관측 적을 죽여 놓은
++        # 채로 판정하면 그 적이 시신으로 취급돼 관측 집합에서 빠지고, 되살릴 근거도
++        # 함께 사라진다.
++        predicted_state: dict[int, tuple[float, int]] = {}
++        for row in rows:
++            unit_id = int(row["id"])
++            if unit_id < 200 or unit_id not in held:
++                continue
++            predicted_state[unit_id] = (float(row["hp"]), int(row["ammo"]))
++            row["hp"], row["ammo"] = held[unit_id]
++
+         observed = _observed_red_ids(rows, obstacles)
+         for row in rows:
+             unit_id = int(row["id"])
+             if unit_id < 200:
+                 continue
++            if unit_id in observed and unit_id in predicted_state:
++                # 보고 있는 동안 예측된 피해만 인정한다. 회복은 없으니 낮은 쪽을 남긴다.
++                hp, ammo = predicted_state[unit_id]
++                row["hp"] = min(float(row["hp"]), hp)
++                row["ammo"] = min(int(row["ammo"]), ammo)
++            held[unit_id] = (float(row["hp"]), int(row["ammo"]))
+             # 전사 확인도 관측이다. 시신 위치에 불확실 원을 씌우면 안 된다.
+             if unit_id in observed or row["hp"] <= 0.0:
+                 last_seen[unit_id] = time_sec
+@@ -557,6 +603,8 @@ def build_archive(
+     device: torch.device,
+     model=None,
+     model_config=None,
++    value_head=None,
++    iterations: int = 1,
+ ) -> dict[str, Any]:
+     """후보를 뽑아 태세 축 아카이브에 배치하고 셀별 elite를 만든다."""
+     node = session.current
+@@ -568,8 +616,8 @@ def build_archive(
+ 
+     cem_config = CEMConfig(
+         num_candidates=candidates,
+-        num_elites=max(2, candidates // 8),
+-        num_iterations=1,
++        num_elites=max(2, candidates // 10),
++        num_iterations=iterations,
+         future_horizon=session.horizon,
+         seed=seed,
+         min_action_probability=0.0,
+@@ -580,9 +628,6 @@ def build_archive(
+     )
+     generator = torch.Generator(device=device)
+     generator.manual_seed(seed)
+-    plans = sample_future_action_plans(
+-        distribution=distribution, current_batch=batch, config=cem_config, generator=generator, device=device
+-    )
+     snapshot = snapshot_from_slot_rows(
+         unit_rows=node.unit_rows,
+         obstacles=session.obstacles,
+@@ -591,7 +636,23 @@ def build_archive(
+         objective=session.objective,
+         mission_type=session.mission_type,
+     )
+-    if model is not None:
++    if value_head is not None:
++        # 학습 루프와 같은 채점을 쓴다. 휴리스틱 evaluator는 항별 가중치가 임의라
++        # "아군을 버린 질주"가 격파의 32배로 평가되는 식의 왜곡이 있었다.
++        score_fn = make_value_score_fn(
++            value_head=value_head,
++            current_batch=batch,
++            mission_type=mission_type_from_config(session.config),
++            device=device,
++        )
++    else:
++        def score_fn(future_features):
++            return score_future_features_torch(current_batch=batch, future_features=future_features)
++
++    def rollout(plans):
++        """후보를 굴려 미래 feature를 낸다. model이 있으면 예측, 없으면 DEVS."""
++        if model is None:
++            return rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
+         # history가 모자라면 현재 state를 복제해 채운다. 초반 결심에서도 예측이 되게.
+         need = int(model_config.history_frames)
+         hist = (session.history + [batch])[-need:]
+@@ -620,14 +681,7 @@ def build_archive(
+                     device=device,
+                 )
+             )
+-        features = torch.cat(chunks, dim=0)
+-    else:
+-        features = rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
+-    scores = score_future_features_torch(current_batch=batch, future_features=features).detach().cpu().numpy()
+-    features_np = features.detach().cpu().numpy()
+-
+-    types = plans.action_type_ids.detach().cpu().numpy()
+-    issued = plans.issued_mask.detach().cpu().numpy()
++        return torch.cat(chunks, dim=0)
+ 
+     # plan 축(BLUE만, 자체 순서)을 slot 축으로 잇는다. 두 축의 순서가 다르므로
+     # entity id로 맞춰야 한다.
+@@ -636,38 +690,52 @@ def build_archive(
+         for index, entity_id in enumerate(batch.entity_ids)
+         if int(batch.type_ids[index]) == int(ObjectType.UNIT)
+     }
+-    plan_unit_ids = plans.action_unit_ids[0, 0].detach().cpu().numpy()
+-    plan_slots = np.array([slot_of[int(unit_id)] for unit_id in plan_unit_ids])
+     hp_now = {int(r["id"]): float(r["hp"]) for r in node.unit_rows}
+-    alive_now = np.array([hp_now.get(int(unit_id), 0.0) > 0.0 for unit_id in plan_unit_ids])
+ 
+     archive: dict[tuple[int, int], dict[str, Any]] = {}
+-    for cand in range(features_np.shape[0]):
+-        # 전사자를 뺀다. 죽은 뒤 스텝의 명령은 실제로 나가지 않으므로, 그대로
+-        # 세면 일찍 전멸한 안이 오히려 적극적으로 교전한 것처럼 보인다.
+-        # 스텝 k의 명령은 k 시작 시점에 살아 있어야 유효하다. k 시작 = k-1 끝.
+-        alive_end = features_np[cand][:, plan_slots, UNIT_HP_INDEX] > 0.0
+-        alive_start = np.concatenate([alive_now[None, :], alive_end[:-1]], axis=0)
+-        engaged = (types[cand] == int(ActionType.ENGAGE)) & issued[cand] & alive_start
+-        engage = float(engaged.sum()) / float(max(int(alive_start.sum()), 1))
+-        rows = _rows_from_features(batch, features_np[cand, -1], node.time_sec + session.horizon)
+-        spread = _formation_change(node.unit_rows, rows)
+-        e_bin = _bin_index(engage, ENGAGE_EDGES)
+-        s_bin = SPREAD_NEUTRAL_BIN if np.isnan(spread) else _bin_index(spread, SPREAD_EDGES)
+-        key = (e_bin, s_bin)
+-        if key not in archive or scores[cand] > archive[key]["score"]:
++    # CEM 반복을 돌리되 **모든 iteration의 후보를 전부 아카이빙**한다. 반복은 분포를
++    # 좁혀 품질을 올리고, 아카이브는 그 과정에서 나온 후보를 태세 축에 흩뿌려 다양성을
++    # 지킨다. 초반 iteration의 넓은 후보와 후반의 좋은 후보가 함께 남는다.
++    for iteration in range(cem_config.num_iterations):
++        plans = sample_future_action_plans(
++            distribution=distribution, current_batch=batch, config=cem_config,
++            generator=generator, device=device,
++        )
++        features = rollout(plans)
++        scores = score_fn(features).detach().cpu().numpy()
++        features_np = features.detach().cpu().numpy()
++        types = plans.action_type_ids.detach().cpu().numpy()
++        issued = plans.issued_mask.detach().cpu().numpy()
++        plan_unit_ids = plans.action_unit_ids[0, 0].detach().cpu().numpy()
++        plan_slots = np.array([slot_of[int(unit_id)] for unit_id in plan_unit_ids])
++        alive_now = np.array([hp_now.get(int(unit_id), 0.0) > 0.0 for unit_id in plan_unit_ids])
++
++        for cand in range(features_np.shape[0]):
++            # 전사자를 뺀다. 죽은 뒤 스텝의 명령은 실제로 나가지 않으므로, 그대로
++            # 세면 일찍 전멸한 안이 오히려 적극적으로 교전한 것처럼 보인다.
++            # 스텝 k의 명령은 k 시작 시점에 살아 있어야 유효하다. k 시작 = k-1 끝.
++            alive_end = features_np[cand][:, plan_slots, UNIT_HP_INDEX] > 0.0
++            alive_start = np.concatenate([alive_now[None, :], alive_end[:-1]], axis=0)
++            engaged = (types[cand] == int(ActionType.ENGAGE)) & issued[cand] & alive_start
++            engage = float(engaged.sum()) / float(max(int(alive_start.sum()), 1))
++            rows = _rows_from_features(batch, features_np[cand, -1], node.time_sec + session.horizon)
++            spread = _formation_change(node.unit_rows, rows)
++            e_bin = _bin_index(engage, ENGAGE_EDGES)
++            s_bin = SPREAD_NEUTRAL_BIN if np.isnan(spread) else _bin_index(spread, SPREAD_EDGES)
++            key = (e_bin, s_bin)
++            if key in archive and scores[cand] <= archive[key]["score"]:
++                continue
+             path = _build_path(
+-                batch,
+-                features_np[cand],
+-                plans,
+-                cand,
+-                node.time_sec,
+-                session.obstacles,
+-                belief_start=node.unit_rows,
++                batch, features_np[cand], plans, cand,
++                node.time_sec, session.obstacles, belief_start=node.unit_rows,
+             )
+             archive[key] = {
+                 "score": float(scores[cand]),
+-                "candidate": int(cand),
++                # iteration마다 plans가 달라지므로 전역 index로는 못 찾는다.
++                # 선택 시 DEVS로 굴릴 수 있게 그 후보의 plan을 여기 들고 있는다.
++                "plan": plans.take_candidates(
++                    torch.tensor([cand], dtype=torch.long, device=plans.action_features.device)
++                ),
+                 "engage": engage,
+                 "spread": 1.0 if np.isnan(spread) else float(spread),
+                 # 마지막 프레임을 그대로 쓴다. 같은 좌표를 다시 만들면 관측 이력이
+@@ -676,7 +744,15 @@ def build_archive(
+                 "path": path,
+             }
+ 
+-    session.pending = {"archive": archive, "plans": plans}
++        if iteration + 1 < cem_config.num_iterations:
++            elite = torch.topk(
++                torch.as_tensor(scores, device=device), k=cem_config.num_elites, largest=True
++            ).indices
++            distribution = update_distribution(
++                distribution=distribution, plans=plans, elite_indices=elite, config=cem_config
++            )
++
++    session.pending = {"archive": archive}
+     cells = []
+     for (e_bin, s_bin), entry in sorted(archive.items()):
+         blue_hp = sum(r["hp"] for r in entry["rows"] if r["id"] < 200)
+@@ -721,6 +797,8 @@ class PlatformState:
+         archive_backend: str = "devs",
+         recommend_backend: str = "devs",
+         recommend_candidates: int = 24,
++        value_head_checkpoint: Path | None = None,
++        archive_iterations: int = 1,
+     ):
+         self.maps: dict[str, dict[str, Any]] = {}
+         for path in sorted(maps_root.iterdir()):
+@@ -744,6 +822,7 @@ class PlatformState:
+         self.archive_backend = archive_backend
+         self.recommend_backend = recommend_backend
+         self.recommend_candidates = recommend_candidates
++        self.archive_iterations = archive_iterations
+         if world_model_checkpoint is not None:
+             payload = torch.load(world_model_checkpoint, map_location=device, weights_only=False)
+             config_dict = dict(payload["model_config"])
+@@ -756,6 +835,10 @@ class PlatformState:
+                 f"월드모델 로드: {world_model_checkpoint.name} "
+                 f"(pred_frames={self.model_config.pred_frames}, history={self.model_config.history_frames})"
+             )
++        self.value_head = None
++        if value_head_checkpoint is not None:
++            self.value_head = load_value_head(value_head_checkpoint, device)
++            print(f"value head 로드: {value_head_checkpoint.name} (아카이브 채점에 사용)")
+ 
+     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+         map_name = str(payload.get("map") or next(iter(self.maps)))
+@@ -822,7 +905,8 @@ class PlatformState:
+             {**r, "observed": True, "last_seen": 0.0} if r["id"] >= 200 else dict(r) for r in rows
+         ]
+         session.nodes[root_id] = TreeNode(
+-            node_id=root_id, parent_id=None, time_sec=0.0, unit_rows=seeded, true_rows=rows
++            node_id=root_id, parent_id=None, time_sec=0.0, unit_rows=seeded, true_rows=rows,
++            red_belief={k: dict(v) for k, v in session.red_belief.items()},
+         )
+         session.current_id = root_id
+         session_id = uuid.uuid4().hex[:8]
+@@ -866,6 +950,8 @@ class PlatformState:
+             "time": node.time_sec,
+             "units": node.unit_rows,
+             "true_units": node.true_rows or node.unit_rows,
++            # 확정된 직전 구간의 실제 경로(DEVS). 후보 미리보기와 달리 예측이 아니다.
++            "true_path": node.true_path,
+             "obstacles": session.config.get("obstacles", []),
+             "building_polygons": session.config.get("building_polygons", []),
+             "world": [WORLD_X_MIN, WORLD_Y_MIN, WORLD_X_MAX, WORLD_Y_MAX],
+@@ -889,6 +975,8 @@ class PlatformState:
+             session, candidates=self.candidates, seed=seed, device=self.device,
+             model=self.model if self.archive_backend == "model" else None,
+             model_config=self.model_config,
++            value_head=self.value_head,
++            iterations=self.archive_iterations,
+         )
+ 
+     def recommend(self, session_id: str, *, candidates: int | None = None) -> dict[str, Any]:
+@@ -923,6 +1011,7 @@ class PlatformState:
+                 archive = build_archive(
+                     session, candidates=num, seed=int(time_sec) * 7919 + len(picks),
+                     device=self.device, model=use_model, model_config=self.model_config,
++                    value_head=self.value_head, iterations=self.archive_iterations,
+                 )
+             finally:
+                 session.nodes, session.current_id = saved_nodes, saved_id
+@@ -963,7 +1052,7 @@ class PlatformState:
+         parent = session.current
+         # 실제 전개는 항상 DEVS로 굴린다. 후보 탐색은 근사여도 되지만 일어난 일은
+         # 진짜여야 오차가 노드마다 누적되지 않는다.
+-        true_rows = self._advance_true(session, parent, entry)
++        true_rows, true_path = self._advance_true(session, parent, entry)
+         time_sec = parent.time_sec + session.horizon
+         belief_rows = _update_belief(session, true_rows, entry["rows"], time_sec)
+         node_id = uuid.uuid4().hex[:8]
+@@ -974,6 +1063,8 @@ class PlatformState:
+             unit_rows=belief_rows,
+             true_rows=true_rows,
+             chosen_label=f"{ENGAGE_LABELS[engage_bin]} · {SPREAD_LABELS[spread_bin]}",
++            red_belief={k: dict(v) for k, v in session.red_belief.items()},
++            true_path=true_path,
+         )
+         parent.children.append(node_id)
+         session.nodes[node_id] = node
+@@ -981,11 +1072,17 @@ class PlatformState:
+         session.pending = {}
+         return self.session_view(session_id)
+ 
+-    def _advance_true(self, session: Session, parent: TreeNode, entry: dict[str, Any]) -> list[dict[str, Any]]:
+-        """선택된 plan 하나만 실제 DEVS로 굴려 진짜 다음 상태를 만든다."""
+-        plans = session.pending.get("plans")
+-        if plans is None:
+-            return entry["rows"]
++    def _advance_true(
++        self, session: Session, parent: TreeNode, entry: dict[str, Any]
++    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
++        """선택된 plan 하나만 실제 DEVS로 굴려 진짜 다음 상태와 그 경로를 만든다.
++
++        rollout_plans_with_devs는 horizon 전 프레임을 돌려준다. 마지막 프레임만 쓰고
++        버리면 확정된 구간마저 예측으로 보여주게 되므로 경로도 함께 만들어 둔다.
++        """
++        plan = entry.get("plan")
++        if plan is None:
++            return entry["rows"], entry.get("path") or []
+         base_rows = parent.true_rows or parent.unit_rows
+         batch = _slot_batch(session, TreeNode("t", None, parent.time_sec, base_rows))
+         snapshot = snapshot_from_slot_rows(
+@@ -996,16 +1093,18 @@ class PlatformState:
+             objective=session.objective,
+             mission_type=session.mission_type,
+         )
+-        index = torch.tensor([int(entry["candidate"])], device=plans.action_features.device)
+         features = rollout_plans_with_devs(
+-            plans=plans.take_candidates(index),
++            plans=plan,
+             snapshot=snapshot,
+             seed=int(parent.time_sec) * 7919,
+             device=self.device,
+         )
+-        return _rows_from_features(
+-            batch, features.detach().cpu().numpy()[0, -1], parent.time_sec + session.horizon
++        frames = features.detach().cpu().numpy()[0]
++        true_path = _build_path(
++            batch, frames, plan, 0, parent.time_sec, session.obstacles,
++            belief_start=parent.unit_rows,
+         )
++        return true_path[-1]["units"], true_path
+ 
+     def goto(self, session_id: str, node_id: str) -> dict[str, Any]:
+         session = self.sessions[session_id]
+@@ -1013,6 +1112,9 @@ class PlatformState:
+             raise ValueError("없는 노드")
+         session.current_id = node_id
+         session.pending = {}
++        # 그 시점에 알고 있던 것만 남긴다. 안 되돌리면 나중 결심에서 관측한 위치가
++        # 과거 노드에도 그대로 보인다.
++        session.red_belief = {k: dict(v) for k, v in session.nodes[node_id].red_belief.items()}
+         return self.session_view(session_id)
+ 
+ 
+@@ -1153,6 +1255,18 @@ def main(argv=None) -> int:
+         default=None,
+         help="지정하면 후보 rollout을 DEVS 대신 월드모델 예측으로 한다(훨씬 빠름, 근사)",
+     )
++    parser.add_argument(
++        "--value-head-checkpoint",
++        type=Path,
++        default=None,
++        help="지정하면 아카이브 채점을 휴리스틱 evaluator 대신 value head로 한다",
++    )
++    parser.add_argument(
++        "--archive-iterations",
++        type=int,
++        default=1,
++        help="CEM 반복 횟수. 매 반복의 후보를 전부 아카이빙하므로 늘리면 셀이 더 찬다",
++    )
+     args = parser.parse_args(argv)
+ 
+     state = PlatformState(
+@@ -1164,6 +1278,8 @@ def main(argv=None) -> int:
+         archive_backend=args.archive_backend,
+         recommend_backend=args.recommend_backend,
+         recommend_candidates=args.recommend_candidates,
++        value_head_checkpoint=args.value_head_checkpoint,
++        archive_iterations=args.archive_iterations,
+     )
+     print(f"지휘관 플랫폼: http://{args.host}:{args.port}/  (API 문서 /docs)")
+     uvicorn.run(create_app(state), host=args.host, port=args.port, log_level="warning")
+diff --git a/naver_dynamic_map_server.py b/naver_dynamic_map_server.py
+index 9e1c03e..18f3be5 100644
+--- a/naver_dynamic_map_server.py
++++ b/naver_dynamic_map_server.py
+@@ -251,6 +251,7 @@ HTML = r"""<!doctype html>
+         <span id="planner">-</span>
+       </div>
+       <div id="counts" class="pill">B0 R0</div>
++      <div id="predError" class="pill" style="color:#fb8500"></div>
+     </div>
+   </div>
+   <div id="message" class="message"></div>
+@@ -272,6 +273,11 @@ HTML = r"""<!doctype html>
+       unitBodies: new Map(),
+       trails: new Map(),
+       fireLines: new Map(),
++      // 월드모델 예측 RED. 주황 원과 실제 위치를 잇는 선. 불확실도 원은 그리지 않는다 —
++      // 여기서 보여줄 것은 "얼마나 모르는가"가 아니라 "예측이 얼마나 맞는가"이고,
++      // 두 점 사이 거리가 곧 그 정보다.
++      predMarkers: new Map(),
++      predLinks: new Map(),
+       obstaclePolygons: [],
+       objectiveMarker: null
+     };
+@@ -717,9 +723,49 @@ HTML = r"""<!doctype html>
+           fire.setPath([]);
+         }
+       }
++      drawPredictions(states);
+       $("counts").textContent = `B${aliveBlue} R${aliveRed}`;
+     }
+ 
++    function drawPredictions(states) {
++      const series = app.data.predictions || {};
++      let sumError = 0;
++      let count = 0;
++      for (const [unitId, samples] of Object.entries(series)) {
++        if (!app.predMarkers.has(unitId)) {
++          app.predMarkers.set(unitId, new naver.maps.Circle({
++            map: app.map, center: new naver.maps.LatLng(0, 0), radius: 3,
++            fillColor: "#fb8500", fillOpacity: 0.0,
++            strokeColor: "#fb8500", strokeOpacity: 0.95, strokeWeight: 3, zIndex: 95
++          }));
++          app.predLinks.set(unitId, new naver.maps.Polyline({
++            map: app.map, path: [], strokeColor: "#fb8500",
++            strokeOpacity: 0.6, strokeWeight: 2, zIndex: 94
++          }));
++        }
++        const marker = app.predMarkers.get(unitId);
++        const link = app.predLinks.get(unitId);
++        const predicted = stateAt(samples, app.currentTime);
++        const actual = states.get(unitId);
++        // 전사한 적 위에 예측을 얹지 않는다. 시신 위치에 겹쳐 봐야 읽을 게 없다.
++        if (!predicted || !actual || Number(actual.hp) <= 0) {
++          marker.setVisible(false);
++          link.setPath([]);
++          continue;
++        }
++        const at = xyToLatLng(predicted.x, predicted.y);
++        marker.setVisible(true);
++        marker.setCenter(at);
++        marker.setRadius(app.config.unitRadiusMeters * 1.15);
++        const truth = xyToLatLng(actual.x, actual.y);
++        link.setPath([truth, at]);
++        sumError += Math.hypot(predicted.x - actual.x, predicted.y - actual.y) * 10;
++        count += 1;
++      }
++      const box = $("predError");
++      if (box) box.textContent = count ? `pred ${(sumError / count).toFixed(1)}m` : "";
++    }
++
+     function tick(nowMs) {
+       if (app.playing) {
+         if (app.lastFrameMs == null) app.lastFrameMs = nowMs;
+@@ -927,6 +973,22 @@ def _bounds(units: dict[str, list[dict[str, Any]]], config: dict[str, Any]) -> O
+     }
+ 
+ 
++def _read_prediction_rows(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
++    """make_prediction_log.py가 남긴 RED 예측 위치. 없으면 빈 dict."""
++    path = run_dir / "prediction_log.csv"
++    if not path.exists():
++        return {}
++    rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
++    with path.open(newline="", encoding="utf-8") as handle:
++        for row in csv.DictReader(handle):
++            rows[str(int(float(row["id"])))].append(
++                {"time": float(row["time"]), "x": float(row["x"]), "y": float(row["y"])}
++            )
++    for series in rows.values():
++        series.sort(key=lambda item: item["time"])
++    return rows
++
++
+ def _state_payload(run_dir: Path, log_path: Path) -> dict[str, Any]:
+     units = _read_unit_rows(log_path)
+     config = _read_json(run_dir / "config.json")
+@@ -937,6 +999,8 @@ def _state_payload(run_dir: Path, log_path: Path) -> dict[str, Any]:
+         "runDir": str(run_dir),
+         "sourceLog": str(log_path),
+         "units": units,
++        # 월드모델이 예측한 RED 위치. 실제와 겹쳐 그려 예측 품질을 눈으로 본다.
++        "predictions": _read_prediction_rows(run_dir),
+         "timeMin": min(times) if times else 0.0,
+         "timeMax": max(times) if times else 0.0,
+         "obstacles": config.get("obstacles", []),
+diff --git a/worldmodel/episodic_cem_training_loop.py b/worldmodel/episodic_cem_training_loop.py
+index f095be5..fd8d5a2 100644
+--- a/worldmodel/episodic_cem_training_loop.py
++++ b/worldmodel/episodic_cem_training_loop.py
+@@ -15,6 +15,7 @@ import os
+ import random
+ import sys
+ import time
++from collections import deque
+ from collections.abc import Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field, replace
+ from datetime import datetime
+@@ -2546,10 +2547,39 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
+     parser.add_argument("--blue-team-mask-count-max", type=int, default=5, help=argparse.SUPPRESS)
+     parser.add_argument("--ema-momentum", type=float, default=0.996)
+     parser.add_argument("--slot-self-state-loss-weight", type=float, default=1.0)
++    parser.add_argument(
++        "--unit-position-loss-weight",
++        type=float,
++        default=0.0,
++        help="unit x/y를 별도 항으로 학습할 가중치. future_state 안에서는 위치 비중이 "
++        "1%% 미만이라 최적화가 이 축을 보지 않는다. 0이면 이전 동작",
++    )
+     parser.add_argument("--cem-candidates", type=int, default=64)
+     parser.add_argument("--cem-elites", type=int, default=8)
+     parser.add_argument("--cem-iterations", type=int, default=3)
+     parser.add_argument("--train-epochs-per-episode", type=int, default=3)
++    parser.add_argument(
++        "--world-model-buffer-episodes",
++        type=int,
++        default=0,
++        help="월드모델 학습 window를 최근 N episode까지 모아 두고 거기서 뽑아 학습한다. "
++        "0이면 이번 episode window만 쓰는 이전 동작. 스텝 수는 그대로고 배치 구성만 섞인다",
++    )
++    parser.add_argument(
++        "--world-model-buffer-seed-run-dir",
++        type=Path,
++        action="append",
++        default=[],
++        help="버퍼를 이전 run의 출력 폴더(episode_* 를 담은 상위 폴더)로 미리 채운다. "
++        "안 채우면 첫 N episode 동안 버퍼가 비어 있어 사실상 이전 동작이 된다",
++    )
++    parser.add_argument(
++        "--world-model-buffer-seed-episodes",
++        type=int,
++        default=40,
++        help="seed로 넣을 episode 수. 배치는 같은 layout끼리만 묶이므로 window가 아니라 "
++        "episode 단위로 넣는다. run dir에는 실행 궤적만 남고 replay window는 없다",
++    )
+     parser.add_argument("--batch-size", type=int, default=8)
+     parser.add_argument("--learning-rate", type=float, default=3e-4)
+     parser.add_argument("--weight-decay", type=float, default=1e-4)
+@@ -2650,6 +2680,47 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
+     return parser.parse_args(list(argv) if argv is not None else None)
+ 
+ 
++def _resume_world_model_optimizer(
++    optimizer: torch.optim.Optimizer,
++    model: torch.nn.Module,
++    saved_state: Mapping[str, object],
++    missing_keys: Iterable[str],
++) -> int:
++    """모델에 파라미터가 추가된 뒤에도 예전 optimizer state를 이어붙인다.
++
++    optimizer state는 파라미터 이름이 아니라 param group 안의 **순번**으로 저장된다.
++    그래서 head를 하나 추가하면 그 뒤 파라미터의 순번이 전부 밀려 그대로는 못 얹고,
++    `load_state_dict`가 "parameter group이 크기가 다르다"로 죽는다.
++
++    checkpoint에 없던 파라미터를 빼고 순번을 다시 맞춘다. 예전부터 있던 파라미터만
++    momentum을 이어받고 새 파라미터는 빈 상태에서 시작한다.
++    """
++    trainable = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
++    fresh = set(missing_keys)
++    old_positions = [index for index, (name, _) in enumerate(trainable) if name not in fresh]
++    saved_groups = list(saved_state.get("param_groups") or ())
++    if len(saved_groups) != 1:
++        raise ValueError(f"param group이 1개일 때만 이어붙일 수 있다 (저장본 {len(saved_groups)}개)")
++    saved_params = list(saved_groups[0]["params"])
++    if len(old_positions) != len(saved_params):
++        raise ValueError(
++            "optimizer state를 이어붙일 수 없다: 저장된 파라미터 "
++            f"{len(saved_params)}개인데 이어받을 자리는 {len(old_positions)}개다. "
++            "파라미터가 추가만 된 게 아니라 제거·재배치됐을 수 있다"
++        )
++    remapped = {
++        old_positions[int(key)]: value for key, value in dict(saved_state["state"]).items()
++    }
++    current_groups = optimizer.state_dict()["param_groups"]
++    optimizer.load_state_dict(
++        {
++            "state": remapped,
++            "param_groups": [{**saved_groups[0], "params": current_groups[0]["params"]}],
++        }
++    )
++    return len(remapped)
++
++
+ def main(argv: Iterable[str] | None = None) -> None:
+     """episode 실행과 종료 후 학습을 반복한다."""
+     args = _parse_args(argv)
+@@ -2802,7 +2873,10 @@ def main(argv: Iterable[str] | None = None) -> None:
+         log_every=args.log_every,
+         checkpoint_path=args.checkpoint_path,
+     )
+-    loss_weights = LossWeights(slot_self_state=args.slot_self_state_loss_weight)
++    loss_weights = LossWeights(
++        slot_self_state=args.slot_self_state_loss_weight,
++        unit_position=args.unit_position_loss_weight,
++    )
+     model, optimizer = create_model_and_optimizer(
+         model_config=model_config,
+         optimizer_config=optimizer_config,
+@@ -2818,9 +2892,20 @@ def main(argv: Iterable[str] | None = None) -> None:
+         # backend로 채점할 때 이전 run에서 학습된 표현을 이어받으려면 여기서
+         # state_dict를 덮어써야 한다. 안 하면 학습 안 된 모델로 채점을 시작한다.
+         payload = torch.load(args.world_model_checkpoint, map_location=device)
+-        model.load_state_dict(payload["model_state_dict"])
++        # 새로 추가된 head(예: unit_position_delta)는 예전 checkpoint에 없다. strict로
++        # 두면 이어 학습 자체가 막히므로 빠진 키는 초기값을 쓰되 무엇이 빠졌는지 찍는다.
++        # 조용히 넘어가면 가중치가 절반만 로드돼도 모른 채 학습하게 된다.
++        incompatible = model.load_state_dict(payload["model_state_dict"], strict=False)
++        if incompatible.missing_keys:
++            print(f"  초기값 사용(checkpoint에 없음): {sorted(incompatible.missing_keys)}")
++        if incompatible.unexpected_keys:
++            print(f"  무시(모델에 없음): {sorted(incompatible.unexpected_keys)}")
+         if args.world_model_resume_optimizer:
+-            optimizer.load_state_dict(payload["optimizer_state_dict"])
++            resumed = _resume_world_model_optimizer(
++                optimizer, model, payload["optimizer_state_dict"], incompatible.missing_keys
++            )
++            if incompatible.missing_keys:
++                print(f"  optimizer state {resumed}개 파라미터 이어받음 (새 파라미터는 빈 상태)")
+             resumed_completed_epochs = int(payload.get("epoch", 0))
+             resumed_global_step = int(payload.get("global_step", 0))
+             early_state = payload.get("early_stopping") or {}
+@@ -2909,36 +2994,41 @@ def main(argv: Iterable[str] | None = None) -> None:
+     if args.policy_entropy_decay_episodes < 0:
+         raise ValueError("--policy-entropy-decay-episodes는 음수일 수 없다")
+ 
+-    value_head = None
+-    value_trainer = None
+-    if args.blue_controller == "cem":
+-        if args.value_head_checkpoint is not None:
+-            value_head = load_value_head(args.value_head_checkpoint, device)
+-            print(f"value head warm-start: {args.value_head_checkpoint}")
+-        else:
+-            value_head = ValueHead(ValueHeadConfig()).to(device)
+-            print("value head 새로 시작 (checkpoint 없음)")
+-        value_trainer = OnlineValueTrainer(
+-            value_head=value_head,
+-            device=device,
+-            learning_rate=args.value_learning_rate,
+-            epochs_per_episode=args.value_epochs_per_episode,
+-            batch_size=args.value_batch_size,
+-            samples_per_episode=args.value_samples_per_episode,
+-            buffer_episodes=args.value_buffer_episodes,
+-            min_episodes=args.value_min_episodes,
+-            seed=args.seed,
+-        )
+-        value_output_path = args.value_head_output_path or args.checkpoint_path.with_name(
+-            f"{args.checkpoint_path.stem}_value.pt"
+-        )
+-        print(
+-            f"value head 온라인 학습: epochs={args.value_epochs_per_episode} "
+-            f"batch={args.value_batch_size} buffer={args.value_buffer_episodes}ep "
+-            f"min={args.value_min_episodes}ep save={value_output_path}"
+-        )
+-        if args.cem_rollout != "devs":
+-            print("  경고: --cem-rollout이 devs가 아니라 월드모델 오차가 채점에 섞인다")
++    # value head는 blue controller와 무관하게 매 에피소드 끝에 학습한다. 학습 입력은
++    # 에피소드의 states_by_time과 mission progress뿐이라 rule 에피소드도 그대로 쓸 수
++    # 있다. 오히려 rule 쪽 신호가 낫다 — CEM으로 모은 에피소드는 임무 달성이 없어
++    # progress가 0에 몰리는데, value_head_v4도 대부분 rule run에서 학습된 것이다.
++    #
++    # rule일 때 value_head가 생기면 `_collect_rollout_replay`의 채점도 value로 바뀌지만,
++    # rule 경로는 num_candidates == rollout_replay_per_tick이라 상위 절반 + 나머지 전부를
++    # 다 담는다. 뽑히는 집합이 점수와 무관하므로 학습 데이터는 그대로다.
++    if args.value_head_checkpoint is not None:
++        value_head = load_value_head(args.value_head_checkpoint, device)
++        print(f"value head warm-start: {args.value_head_checkpoint}")
++    else:
++        value_head = ValueHead(ValueHeadConfig()).to(device)
++        print("value head 새로 시작 (checkpoint 없음)")
++    value_trainer = OnlineValueTrainer(
++        value_head=value_head,
++        device=device,
++        learning_rate=args.value_learning_rate,
++        epochs_per_episode=args.value_epochs_per_episode,
++        batch_size=args.value_batch_size,
++        samples_per_episode=args.value_samples_per_episode,
++        buffer_episodes=args.value_buffer_episodes,
++        min_episodes=args.value_min_episodes,
++        seed=args.seed,
++    )
++    value_output_path = args.value_head_output_path or args.checkpoint_path.with_name(
++        f"{args.checkpoint_path.stem}_value.pt"
++    )
++    print(
++        f"value head 온라인 학습: epochs={args.value_epochs_per_episode} "
++        f"batch={args.value_batch_size} buffer={args.value_buffer_episodes}ep "
++        f"min={args.value_min_episodes}ep save={value_output_path}"
++    )
++    if args.blue_controller == "cem" and args.cem_rollout != "devs":
++        print("  경고: --cem-rollout이 devs가 아니라 월드모델 오차가 채점에 섞인다")
+ 
+     policy = None
+     policy_optimizer = None
+@@ -2986,6 +3076,44 @@ def main(argv: Iterable[str] | None = None) -> None:
+     completed_episode_count = 0
+     started = time.time()
+     terrain_rng = random.Random(args.seed + 777)
++    # 월드모델 학습 window 버퍼. maxlen=0이면 deque가 아무것도 안 담으므로,
++    # 꺼져 있을 때는 아예 쓰지 않는다(호출부에서 분기).
++    window_buffer: deque = deque(maxlen=max(1, args.world_model_buffer_episodes))
++    window_rng = np.random.default_rng(args.seed + 991)
++    # warm-start한 가중치가 학습했던 데이터를 버퍼에 미리 넣어 둔다. 안 넣으면 버퍼가
++    # 찰 때까지(N episode) 이전 동작과 같고, 그 구간에서 이미 가중치가 흘러가 버린다.
++    # 이 seed는 밀려나지 않고 계속 남는다.
++    #
++    # episode 단위로 담는 이유: collate_training_batch의 _validate_batch_layout이 배치
++    # 안에서 entity_ids까지 같기를 요구한다. 맵과 병력 구성이 모두 같아야 하는데 병력이
++    # 2~10으로 무작위라 조합이 사실상 겹치지 않는다. 그래서 window를 섞을 수 없고,
++    # 한 배치는 반드시 한 episode 안에서만 만들어야 한다.
++    seed_groups: list = []
++    if args.world_model_buffer_episodes > 0 and args.world_model_buffer_seed_run_dir:
++        episode_dirs = sorted(
++            path
++            for root in args.world_model_buffer_seed_run_dir
++            for path in root.glob("episode_*")
++            if path.is_dir()
++        )
++        if not episode_dirs:
++            raise ValueError("--world-model-buffer-seed-run-dir 아래에 episode_* 폴더가 없다")
++        wanted = min(max(0, args.world_model_buffer_seed_episodes), len(episode_dirs))
++        chosen = window_rng.choice(len(episode_dirs), size=wanted, replace=False)
++        for index in sorted(chosen.tolist()):
++            specs = build_training_windows(
++                (episode_dirs[index],),
++                history_frames=model_config.history_frames,
++                pred_frames=model_config.pred_frames,
++                time_step=1.0,
++            )
++            if specs:
++                seed_groups.append(list(load_training_windows(specs)))
++        print(
++            f"world model buffer seed: episode_dirs={len(episode_dirs)} "
++            f"loaded={len(seed_groups)}개 episode "
++            f"windows={sum(len(g) for g in seed_groups)} (실행 궤적만, replay window 제외)"
++        )
+     for episode_index in range(1, args.episodes + 1):
+         completed_episode_count = episode_index
+         episode_mission_type = MISSION_DESTROY_AND_REACH
+@@ -3110,6 +3238,9 @@ def main(argv: Iterable[str] | None = None) -> None:
+         )
+         _append_episode_summary(args.output_root, result, objective=CURRENT_OBJECTIVE)
+         train_metrics = ()
++        # 검증을 껐을 때도 주기 보관본을 남겨야 하므로 여기서 초기화해 둔다.
++        validation_metrics = None
++        validation_value = None
+         if args.freeze_world_model:
+             # policy head는 CEM이 실제 실행한 trajectory로 학습하지만, 이미 검증된
+             # JEPA rollout 평가기는 고정해 policy 변화만 관찰한다.
+@@ -3138,17 +3269,81 @@ def main(argv: Iterable[str] | None = None) -> None:
+                     f"steps={int(value_metrics['steps'])} mae={value_metrics['mae']:.4f}"
+                 )
+ 
+-            train_metrics, global_step = train_existing_model(
+-                model=model,
+-                optimizer=optimizer,
+-                windows=windows + result.rollout_windows,
+-                model_config=model_config,
+-                optimizer_config=optimizer_config,
+-                loss_weights=loss_weights,
+-                start_epoch=completed_epochs,
+-                global_step=global_step,
++            # 이번 episode의 window로만 학습하면 가중치가 최신 episode를 쫓아가 이전
++            # 것을 잊는다. statickv는 400 episode를 돌고도 epoch loss가 0.356~0.689를
++            # 오갔고(수렴이 아니라 진동), 거기서 25 episode를 더 학습하자 RED 예측
++            # 오차가 9.6m -> 14.4m로 나빠졌다.
++            #
++            # 버퍼 전체를 매번 학습하면 episode 시간이 버퍼 배수로 늘어난다. 그래서
++            # **이번 episode의 window 수만큼만** 버퍼에서 뽑는다. 옵티마이저 스텝 수는
++            # 그대로고 배치가 여러 episode에서 섞여 오기만 한다.
++            episode_windows = windows + result.rollout_windows
++            groups = [episode_windows]
++            if args.world_model_buffer_episodes > 0:
++                window_buffer.append(episode_windows)
++                # 한 배치는 한 episode 안에서만 만들 수 있으므로(위 seed 주석 참고) window를
++                # 섞는 대신 **episode를 번갈아** 학습한다. 이번 episode 1 epoch + 버퍼에서
++                # 뽑은 이전 episode 1 epoch씩이라, 총 epoch 수와 episode 시간은 그대로다.
++                others = list(window_buffer)[:-1] + seed_groups
++                extra = min(len(others), max(0, optimizer_config.epochs - 1))
++                if extra > 0:
++                    picked = window_rng.choice(len(others), size=extra, replace=False)
++                    groups += [others[int(index)] for index in picked]
++                print(
++                    f"world_model_buffer episodes={len(window_buffer)}"
++                    f"/{args.world_model_buffer_episodes} seed={len(seed_groups)} "
++                    f"trained_groups={len(groups)}"
++                )
++
++            # group이 하나면 이전과 완전히 같은 동작(그 episode로 epochs만큼)이다.
++            group_config = (
++                replace(optimizer_config, epochs=1) if len(groups) > 1 else optimizer_config
+             )
+-            completed_epochs += optimizer_config.epochs
++            for offset, group in enumerate(groups):
++                train_metrics, global_step = train_existing_model(
++                    model=model,
++                    optimizer=optimizer,
++                    windows=tuple(group),
++                    model_config=model_config,
++                    optimizer_config=group_config,
++                    loss_weights=loss_weights,
++                    start_epoch=completed_epochs + offset,
++                    global_step=global_step,
++                )
++            # group을 번갈아 돌 때는 group당 1 epoch이므로 실제로 돈 만큼만 센다.
++            # 버퍼가 덜 찬 초반에는 group이 epochs보다 적을 수 있다.
++            completed_epochs += optimizer_config.epochs if len(groups) == 1 else len(groups)
++
++            # 주기 보관본. latest/best는 같은 경로를 덮으므로, 나중에 시점별로 되짚으려면
++            # 별도 파일이 있어야 한다. 검증과 무관한 기능이라 validation 블록 밖에 둔다 —
++            # 안에 있으면 --validation-run-dir 없이는 조용히 아무것도 안 남는다.
++            if args.checkpoint_archive_every > 0 and (
++                episode_index % args.checkpoint_archive_every == 0
++            ):
++                archive_path = args.checkpoint_path.with_name(
++                    f"{args.checkpoint_path.stem}_ep{episode_index:04d}"
++                    f"{args.checkpoint_path.suffix}"
++                )
++                save_checkpoint(
++                    path=archive_path,
++                    model=model,
++                    optimizer=optimizer,
++                    model_config=model_config,
++                    optimizer_config=optimizer_config,
++                    loss_weights=loss_weights,
++                    epoch=completed_epochs,
++                    global_step=global_step,
++                    metrics=train_metrics,
++                    episode=episode_index,
++                    checkpoint_kind="archive",
++                    validation_metrics=validation_metrics,
++                    validation_monitor=args.validation_monitor,
++                    validation_value=validation_value,
++                    best_validation_value=best_validation_value,
++                    best_episode=best_episode,
++                    bad_validation_checks=bad_validation_checks,
++                )
++                print(f"checkpoint_archive={archive_path}")
+ 
+             if validation_windows and episode_index % args.validation_every == 0:
+                 validation_metrics = evaluate_existing_model(
+@@ -3217,36 +3412,6 @@ def main(argv: Iterable[str] | None = None) -> None:
+                     best_episode=best_episode,
+                     bad_validation_checks=bad_validation_checks,
+                 )
+-                # 주기 보관본. latest/best는 같은 경로를 덮으므로, 검증 잡음 때문에
+-                # 잘못 고른 best를 나중에 되짚으려면 시점별 파일이 있어야 한다.
+-                if args.checkpoint_archive_every > 0 and (
+-                    episode_index % args.checkpoint_archive_every == 0
+-                ):
+-                    archive_path = args.checkpoint_path.with_name(
+-                        f"{args.checkpoint_path.stem}_ep{episode_index:04d}"
+-                        f"{args.checkpoint_path.suffix}"
+-                    )
+-                    save_checkpoint(
+-                        path=archive_path,
+-                        model=model,
+-                        optimizer=optimizer,
+-                        model_config=model_config,
+-                        optimizer_config=optimizer_config,
+-                        loss_weights=loss_weights,
+-                        epoch=completed_epochs,
+-                        global_step=global_step,
+-                        metrics=train_metrics,
+-                        episode=episode_index,
+-                        checkpoint_kind="archive",
+-                        validation_metrics=validation_metrics,
+-                        validation_monitor=args.validation_monitor,
+-                        validation_value=validation_value,
+-                        best_validation_value=best_validation_value,
+-                        best_episode=best_episode,
+-                        bad_validation_checks=bad_validation_checks,
+-                    )
+-                    print(f"checkpoint_archive={archive_path}")
+-
+                 validation_row = {
+                     "episode": episode_index,
+                     "epoch": completed_epochs,
+diff --git a/worldmodel/measure_belief_coverage.py b/worldmodel/measure_belief_coverage.py
+index 156b4a7..07a95a6 100644
+--- a/worldmodel/measure_belief_coverage.py
++++ b/worldmodel/measure_belief_coverage.py
+@@ -123,7 +123,11 @@ def _load_model(checkpoint: Path, device: torch.device):
+     config_dict["maskable_type_ids"] = tuple(config_dict["maskable_type_ids"])
+     config = ObjectSlotModelConfig(**config_dict)
+     model = DEVSObjectCentricWorldModel(config).to(device)
+-    model.load_state_dict(payload["model_state_dict"])
++    # 새 head가 없는 예전 checkpoint도 재야 하므로 strict로 두지 않는다. 대신 빠진
++    # 키를 찍어, 가중치가 덜 로드된 채로 측정하는 일이 조용히 지나가지 않게 한다.
++    incompatible = model.load_state_dict(payload["model_state_dict"], strict=False)
++    if incompatible.missing_keys:
++        print(f"  초기값 사용(checkpoint에 없음): {sorted(incompatible.missing_keys)}")
+     model.eval()
+     return model, config
+ 
+diff --git a/worldmodel/object_slot_attention.py b/worldmodel/object_slot_attention.py
+index fcd484d..0c1a16e 100644
+--- a/worldmodel/object_slot_attention.py
++++ b/worldmodel/object_slot_attention.py
+@@ -18,6 +18,7 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++from hackerthon.terrain import WORLD_X_MAX, WORLD_X_MIN, WORLD_Y_MAX, WORLD_Y_MIN
+ from hackerthon.worldmodel.actions import ACTION_DIM
+ from hackerthon.worldmodel.slots import (
+     MAX_FEATURE_DIM,
+@@ -43,6 +44,31 @@ from hackerthon.worldmodel.slots import (
+ # 0으로 두면 이전 경로(전체 slot이 query)라 같은 코드로 A/B를 돌릴 수 있다.
+ STATIC_TERRAIN_KV = os.environ.get("CJEPA_STATIC_TERRAIN_KV", "1") not in ("0", "false", "False")
+ 
++# rollout 예측에 물리 제약을 씌운다. 학습 손실에는 관여하지 않고 planning/표시에만 쓴다.
++#
++# 월드모델은 한 번에 6프레임을 내놓을 뿐 프레임 간 연속성이나 이동 한계를 모른다.
++# 실측에서 프레임 간 이동이 중앙 2.5m인데 최대 24.9m로, 한 스텝 한계 15m를 1.2%가
++# 넘겼다. 전사자는 더 심해서 hp=0인데 6스텝에 44m를 움직였다.
++UNIT_HP_FEATURE_INDEX, UNIT_X_FEATURE_INDEX, UNIT_Y_FEATURE_INDEX = 1, 3, 4
++# 한 스텝 최대 이동(월드 유닛). cem_planner.MAX_MOVE_PER_STEP, devs next_waypoint와 같다.
++MAX_MOVE_PER_STEP_UNITS = 1.5
++ENFORCE_ROLLOUT_PHYSICS = os.environ.get("CJEPA_ROLLOUT_PHYSICS", "1") not in ("0", "false", "False")
++
++# 유닛 위치를 절대 좌표가 아니라 **마지막 관측 위치로부터의 변화량**으로 예측한다.
++#
++# 실측(DEVS 60 에피소드, RED 19,014표본): 유닛이 실제로 움직이는 거리는 t+1s에 평균
++# 3.9m / 중앙 0.0m다. 절반은 1초 동안 그 자리에 있다. 그런데 절대 좌표를 디코딩하면
++# "안 움직였다"를 표현하는 데도 디코더가 입력 좌표를 토큰 병목으로 재현해야 하고,
++# 그 복원 오차만 2.02m가 깔린다. 실제 예측 오차는 9.6m로 **정지 가정(3.9m)보다 2.5배
++# 나빴다.** 지형은 이미 같은 이유로 마지막 관측값을 그대로 쓴다.
++#
++# delta head는 영-초기화한다. 그래서 켠 직후 모델은 정확히 "안 움직임"을 예측하고,
++# 학습은 그 기준선 위에서 실제 변화량만 배우면 된다.
++#
++# 주의: 이 플래그를 켜고 학습한 checkpoint는 켠 상태로 써야 한다. 끄면 delta head가
++# 무시돼 위치가 전부 어긋난다.
++POSITION_RESIDUAL = os.environ.get("CJEPA_POSITION_RESIDUAL", "0") not in ("0", "false", "False")
++
+ 
+ TEAM_EMBEDDING_INDEX: Mapping[int, int] = {
+     int(TeamId.NONE): 0,
+@@ -949,6 +975,99 @@ class CausalMaskedObjectPredictor(nn.Module):
+         return output[:, history_frames:self.total_frames, :num_slots]
+ 
+ 
++def _enforce_unit_physics(
++    future_features: torch.Tensor,
++    *,
++    last_observed: torch.Tensor,
++    type_ids: torch.Tensor,
++) -> torch.Tensor:
++    """예측된 unit 궤적에 이동 한계와 전사자 고정을 씌운다.
++
++    월드모델은 6프레임을 한 번에 내놓을 뿐 프레임 간 연속성이나 이동 한계를 모른다.
++    실측에서 프레임 간 이동이 중앙 2.5m인데 최대 24.9m로 한 스텝 한계 15m를 넘겼고,
++    hp=0인 전사자가 6스텝에 44m를 움직였다.
++
++    두 가지를 강제한다.
++      1. 프레임 간 이동을 `MAX_MOVE_PER_STEP_UNITS`로 제한한다. 방향은 살리고 크기만
++         줄이므로 예측이 가리키는 쪽은 유지된다.
++      2. hp<=0이면 그 자리에 고정한다. 이미 죽어 있었으면 마지막 관측 위치에, 예측
++         도중 죽으면 죽은 프레임 위치에 멈춘다.
++
++    학습 손실은 `predict_cjepa_sequence`를 쓰므로 여기 변경이 gradient에 안 섞인다.
++    planning과 화면 표시에만 적용된다.
++    """
++    _expect_rank("future_features", future_features, 4)
++    _expect_rank("last_observed", last_observed, 3)
++    is_unit = (type_ids[:, 0] == int(ObjectType.UNIT)).unsqueeze(-1)   # (B, N, 1)
++    span = torch.tensor(
++        [0.5 * (WORLD_X_MAX - WORLD_X_MIN), 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN)],
++        dtype=future_features.dtype,
++        device=future_features.device,
++    )
++    position_index = [UNIT_X_FEATURE_INDEX, UNIT_Y_FEATURE_INDEX]
++
++    frames = []
++    previous = last_observed[..., position_index]                      # (B, N, 2)
++    alive = last_observed[..., UNIT_HP_FEATURE_INDEX] > 0.0            # (B, N)
++    for step in range(future_features.shape[1]):
++        frame = future_features[:, step]
++        target = frame[..., position_index]
++        # 이동 한계: 월드 단위로 재서 넘치면 방향을 유지한 채 줄인다.
++        delta_world = (target - previous) * span
++        distance = delta_world.norm(dim=-1, keepdim=True).clamp_min(1e-9)
++        scale = (MAX_MOVE_PER_STEP_UNITS / distance).clamp(max=1.0)
++        clamped = previous + delta_world * scale / span
++
++        # 전사자 고정: 이번 프레임에 죽어 있거나 이미 죽었으면 직전 위치를 유지한다.
++        alive = alive & (frame[..., UNIT_HP_FEATURE_INDEX] > 0.0)
++        moved = torch.where(alive.unsqueeze(-1) & is_unit, clamped, previous)
++        # unit이 아닌 slot은 손대지 않는다.
++        position = torch.where(is_unit, moved, target)
++
++        frame = frame.clone()
++        frame[..., UNIT_X_FEATURE_INDEX] = position[..., 0]
++        frame[..., UNIT_Y_FEATURE_INDEX] = position[..., 1]
++        frames.append(frame)
++        previous = position
++    return torch.stack(frames, dim=1)
++
++
++def _apply_position_residual(
++    future_features: torch.Tensor,
++    *,
++    delta: torch.Tensor,
++    last_observed: torch.Tensor,
++    type_ids: torch.Tensor,
++) -> torch.Tensor:
++    """유닛 x/y를 "마지막 관측 위치 + 예측 변화량"으로 바꾼다.
++
++    지형에 이미 쓰고 있는 논리를 유닛에도 적용하는 것이다. 다만 지형은 아예 정지라
++    마지막 값을 그대로 쓰고, 유닛은 움직이므로 변화량만 예측하게 한다.
++
++    `future_features`는 `(B, F, N, MAX_FEATURE_DIM)`, `delta`는 `(B, F, N, 2)`,
++    `last_observed`는 `(B, N, MAX_FEATURE_DIM)`이다. unit이 아닌 slot은 손대지 않는다.
++    """
++    _expect_rank("future_features", future_features, 4)
++    _expect_rank("delta", delta, 4)
++    _expect_rank("last_observed", last_observed, 3)
++    if delta.shape[-1] != 2:
++        raise ValueError("delta 마지막 차원은 2(Δx, Δy)여야 한다")
++    if delta.shape[:3] != future_features.shape[:3]:
++        raise ValueError("delta와 future_features의 (B, F, N)이 같아야 한다")
++
++    position_index = [UNIT_X_FEATURE_INDEX, UNIT_Y_FEATURE_INDEX]
++    is_unit = (type_ids == int(ObjectType.UNIT)).unsqueeze(-1)
++    anchor = last_observed[..., position_index].unsqueeze(1)          # (B, 1, N, 2)
++    residual = anchor + delta
++    absolute = future_features[..., position_index]
++    position = torch.where(is_unit, residual, absolute)
++
++    updated = future_features.clone()
++    updated[..., UNIT_X_FEATURE_INDEX] = position[..., 0]
++    updated[..., UNIT_Y_FEATURE_INDEX] = position[..., 1]
++    return updated
++
++
+ def cjepa_prediction_loss(
+     *,
+     pred_tokens: torch.Tensor,
+@@ -1305,6 +1424,13 @@ class DEVSObjectCentricWorldModel(nn.Module):
+             nn.LayerNorm(dim),
+             nn.Linear(dim, dim),
+         )
++        # 유닛 위치 변화량(Δx, Δy) 전용 head. 마지막 층을 0으로 두어 학습 시작 시점의
++        # 예측이 정확히 "마지막 관측 위치 그대로"가 되게 한다. 실측 정지 가정 오차
++        # (RED t+1s 3.9m)에서 출발하므로, 현재 절대 좌표 예측(9.6m)보다 이미 낫다.
++        self.unit_position_delta = _mlp(dim, self.config.hidden_dim, 2, self.config.dropout)
++        final_delta_layer = self.unit_position_delta[-1]
++        nn.init.zeros_(final_delta_layer.weight)
++        nn.init.zeros_(final_delta_layer.bias)
+         self.masked_predictor = CausalMaskedObjectPredictor(self.config)
+         self.state_decoder = ObjectStateDecoder(self.config)
+         self.self_state_decoder = SlotSelfStateDecoder(self.config)
+@@ -1595,6 +1721,23 @@ class DEVSObjectCentricWorldModel(nn.Module):
+                 type_ids.shape[2],
+             ),
+         ).reshape(features.shape[0], total_frames, features.shape[2], MAX_FEATURE_DIM)
++        if POSITION_RESIDUAL:
++            # 미래 프레임만 잔차로 바꾼다. history 구간 출력은 masked-state loss용이라
++            # "마지막 관측 프레임"을 기준으로 삼을 수 없다.
++            #
++            # rollout_cjepa_future와 같은 식이어야 한다. 학습과 추론이 어긋나면 지금까지
++            # 겪은 것과 같은 종류의 조용한 불일치가 된다.
++            future_updated = _apply_position_residual(
++                pred_features[:, history_frames:total_frames],
++                delta=self.unit_position_delta(pred_tokens[:, history_frames:total_frames]),
++                last_observed=features[:, history_frames - 1],
++                type_ids=type_ids[:, 0].unsqueeze(1).expand(
++                    type_ids.shape[0], self.config.pred_frames, type_ids.shape[2]
++                ),
++            )
++            pred_features = torch.cat(
++                [pred_features[:, :history_frames], future_updated], dim=1
++            )
+         # 이 출력은 slot self-state loss 전용이다. 입력이 history_tokens뿐이라
+         # loss를 단독으로 걸면 predictor/action 경로에는 gradient가 흐르지 않는다.
+         history_self_features = self.self_state_decoder(
+@@ -1722,6 +1865,19 @@ class DEVSObjectCentricWorldModel(nn.Module):
+         is_terrain = (future_type_ids == int(ObjectType.TERRAIN)).unsqueeze(-1)
+         static_features = history_features[:, -1].unsqueeze(1).expand_as(future_features)
+         future_features = torch.where(is_terrain, static_features, future_features)
++        if POSITION_RESIDUAL:
++            future_features = _apply_position_residual(
++                future_features,
++                delta=self.unit_position_delta(future_tokens),
++                last_observed=history_features[:, -1],
++                type_ids=future_type_ids,
++            )
++        if ENFORCE_ROLLOUT_PHYSICS:
++            future_features = _enforce_unit_physics(
++                future_features,
++                last_observed=history_features[:, -1],
++                type_ids=future_type_ids,
++            )
+         return {
+             "history_tokens": history_tokens,
+             "action_tokens": action_tokens,
+diff --git a/worldmodel/train_object_centric_jepa.py b/worldmodel/train_object_centric_jepa.py
+index 1f39b04..8fec76a 100644
+--- a/worldmodel/train_object_centric_jepa.py
++++ b/worldmodel/train_object_centric_jepa.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import math
++import os
+ import sys
+ from collections.abc import Iterable
+ from dataclasses import asdict, dataclass
+@@ -36,6 +37,21 @@ from hackerthon.worldmodel.slots import (
+ 
+ UNIT_HP_INDEX = 1
+ UNIT_ALIVE_INDEX = 7
++UNIT_X_INDEX, UNIT_Y_INDEX = 3, 4
++
++# 위치 손실을 L2 대신 L1으로. 실측(홀드아웃 euljiro, respos ep0200)에서 RED의 1초
++# 변위는 **중앙값 0m / 평균 3.9m**인 이중 분포다 — 대부분 정지하고 가끔 10m를 뛴다.
++# L2는 그런 분포에서 평균으로 수렴하므로 모델이 "항상 조금씩 움직인다"를 배운다.
++# 실제로 t+1s에 144건 중 135건이 정지인데 모델은 평균 6.3m를 움직인다고 예측했다.
++# L1은 중앙값으로 수렴하므로 "기본은 정지"가 된다.
++#
++# 부수 효과로 gradient가 오차 크기에 비례하지 않고 일정해서, 오차가 작아져도 힘이
++# 빠지지 않는다. L2에서는 축당 4m까지 내려가면 손실 기여가 1.8%로 떨어져 사실상
++# 무력해졌다.
++#
++# 값의 스케일이 sqrt만큼 커지므로 --unit-position-loss-weight도 다시 잡아야 한다
++# (L2에서 30이면 L1에서는 3 근처).
++POSITION_LOSS_L1 = os.environ.get("CJEPA_POSITION_LOSS_L1", "0") not in ("0", "false", "False")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -130,6 +146,8 @@ class LossWeights:
+     combat_state: float = 4.0
+     damage_delta: float = 8.0
+     slot_self_state: float = 1.0
++    # 위치는 future_state 안에서 비중이 1% 미만이라 별도 항으로 뺀다. 0이면 이전 동작.
++    unit_position: float = 0.0
+ 
+     def __post_init__(self) -> None:
+         """손실 가중치가 음수가 아닌지 확인한다."""
+@@ -140,6 +158,7 @@ class LossWeights:
+             ("combat_state", self.combat_state),
+             ("damage_delta", self.damage_delta),
+             ("slot_self_state", self.slot_self_state),
++            ("unit_position", self.unit_position),
+         ):
+             if float(value) < 0.0:
+                 raise ValueError(f"{name} loss weight는 음수일 수 없다")
+@@ -150,6 +169,7 @@ class LossWeights:
+             + self.combat_state
+             + self.damage_delta
+             + self.slot_self_state
++            + self.unit_position
+             <= 0.0
+         ):
+             raise ValueError("loss weight 합은 0보다 커야 한다")
+@@ -198,6 +218,7 @@ class StepMetrics:
+     loss_combat_state: float
+     loss_damage_delta: float
+     loss_slot_self_state: float
++    loss_unit_position: float = 0.0
+ 
+ 
+ def _validate_state_sequence(states: tuple[SlotBatch, ...]) -> None:
+@@ -446,6 +467,52 @@ def _combat_unit_weights(type_ids: torch.Tensor, team_ids: torch.Tensor) -> torc
+     return red.float() * 3.0 + blue.float()
+ 
+ 
++def _unit_position_loss(
++    *,
++    pred_future: torch.Tensor,
++    target_future: torch.Tensor,
++    feature_mask: torch.Tensor,
++    type_ids: torch.Tensor,
++) -> torch.Tensor:
++    """살아 있는 unit의 x/y만 따로 본다.
++
++    `future_state`는 unit feature 8개를 평균하는데, 정규좌표 ±1이 ±200m라 위치
++    오차가 손실에서 차지하는 비중이 1%도 안 된다. 실측(2026-08-10):
++
++    ```
++    위치오차  3.9m -> future_state(0.07) 기여 0.1%
++    위치오차  9.6m ->                      0.8%
++    위치오차 25.7m ->                      5.9%
++    ```
++
++    그래서 위치를 2.7배 망가뜨려도 손실은 0.004밖에 안 늘고, hp/ammo/alive를 조금만
++    개선하면 그 손해가 덮인다. 실제로 statickv5는 loss가 0.554 -> 0.426으로 내려가는
++    동안 위치 오차가 t+3s 16.8 -> 25.7m로 나빠졌다. 손실이 위치를 안 보기 때문이다.
++
++    지형이 유닛 gradient를 희석하던 문제(`future_dynamic` 주석)와 같은 종류이고,
++    처방도 같다 — 해당 항만 떼어 별도 가중치를 준다.
++    """
++    if pred_future.shape != target_future.shape:
++        raise ValueError("unit_position pred/target shape가 같아야 한다")
++    if feature_mask.shape != pred_future.shape:
++        raise ValueError("unit_position feature_mask shape가 pred와 같아야 한다")
++    unit = type_ids == int(ObjectType.UNIT)
++    # 전사한 유닛의 좌표는 시신 위치라 예측 대상이 아니다.
++    alive = target_future[..., UNIT_ALIVE_INDEX] >= 0.5
++    valid = unit & alive
++    total = pred_future.new_zeros(())
++    denom = pred_future.new_zeros(())
++    for index in (UNIT_X_INDEX, UNIT_Y_INDEX):
++        selected = valid & feature_mask[..., index]
++        difference = pred_future[..., index] - target_future[..., index]
++        error = difference.abs() if POSITION_LOSS_L1 else difference.pow(2)
++        total = total + (error * selected.float()).sum()
++        denom = denom + selected.float().sum()
++    if float(denom.detach().cpu().item()) <= 0.0:
++        return pred_future.new_zeros(())
++    return total / denom
++
++
+ def _combat_state_loss(
+     *,
+     pred_future: torch.Tensor,
+@@ -553,6 +620,13 @@ def compute_training_losses(
+         team_ids=batch.team_ids[:, future_slice],
+     )
+ 
++    unit_position_loss = _unit_position_loss(
++        pred_future=pred_features[:, future_slice],
++        target_future=batch.features[:, future_slice],
++        feature_mask=batch.feature_mask[:, future_slice],
++        type_ids=batch.type_ids[:, future_slice],
++    )
++
+     masked_indices = model_output["masked_indices"]
+     if masked_indices.ndim != 1:
+         raise ValueError("masked_indices rank는 1이어야 한다")
+@@ -573,6 +647,7 @@ def compute_training_losses(
+         + weights.combat_state * combat_state_loss
+         + weights.damage_delta * damage_delta_loss
+         + weights.slot_self_state * slot_self_state_loss
++        + weights.unit_position * unit_position_loss
+     )
+     metrics = StepMetrics(
+         loss_total=float(loss_total.detach().cpu().item()),
+@@ -584,6 +659,7 @@ def compute_training_losses(
+         loss_combat_state=float(combat_state_loss.detach().cpu().item()),
+         loss_damage_delta=float(damage_delta_loss.detach().cpu().item()),
+         loss_slot_self_state=float(slot_self_state_loss.detach().cpu().item()),
++        loss_unit_position=float(unit_position_loss.detach().cpu().item()),
+     )
+     return loss_total, metrics
+ 
+@@ -613,6 +689,7 @@ def _mean_metrics(metrics: tuple[StepMetrics, ...]) -> StepMetrics:
+         loss_masked_history_state=sum(item.loss_masked_history_state for item in metrics) / count,
+         loss_combat_state=sum(item.loss_combat_state for item in metrics) / count,
+         loss_damage_delta=sum(item.loss_damage_delta for item in metrics) / count,
++        loss_unit_position=sum(item.loss_unit_position for item in metrics) / count,
+         loss_slot_self_state=sum(item.loss_slot_self_state for item in metrics) / count,
+     )
+ 
+@@ -704,6 +781,7 @@ def _weighted_mean_metrics(
+         loss_masked_history_state=mean("loss_masked_history_state"),
+         loss_combat_state=mean("loss_combat_state"),
+         loss_damage_delta=mean("loss_damage_delta"),
++        loss_unit_position=mean("loss_unit_position"),
+         loss_slot_self_state=mean("loss_slot_self_state"),
+     )
+ 
+@@ -872,6 +950,7 @@ def train_existing_model(
+                     f"latent={metrics.loss_latent:.6f} future_state={metrics.loss_future_state:.6f} "
+                     f"masked_state={metrics.loss_masked_history_state:.6f} "
+                     f"combat_state={metrics.loss_combat_state:.6f} damage_delta={metrics.loss_damage_delta:.6f} "
++                    f"unit_position={metrics.loss_unit_position:.6f} "
+                     f"slot_self={metrics.loss_slot_self_state:.6f}"
+                 )
+         mean_metrics = _mean_metrics(tuple(step_metrics))
+@@ -882,6 +961,7 @@ def train_existing_model(
+             f"future={mean_metrics.loss_future:.6f} masked={mean_metrics.loss_masked_history:.6f} "
+             f"future_state={mean_metrics.loss_future_state:.6f} "
+             f"combat_state={mean_metrics.loss_combat_state:.6f} damage_delta={mean_metrics.loss_damage_delta:.6f} "
++            f"unit_position={mean_metrics.loss_unit_position:.6f} "
+             f"slot_self={mean_metrics.loss_slot_self_state:.6f}"
+         )
+         save_checkpoint(
