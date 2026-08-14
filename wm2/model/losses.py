@@ -51,6 +51,12 @@ def compute_losses(
         return (error * selection).sum() / count
 
     loss_pos = masked_mean((outputs["dpos"] - labels["dpos"]).abs().sum(dim=-1))
+    # 피해는 MSE(평균 학습) + 큰 가중치(config, run10 실측 근거) 조합이어야 한다.
+    # 피해 라벨은 "절반은 0, 나머지는 크게"인 쏠림 분포(cf4_mid 실측: hold 평균
+    # 10.0/중앙값 0.2HP)라 L1로 바꾸면 중앙값을 배워 기대 피해가 ~0으로 붕괴한다
+    # (run10: hold 상상 1.9 vs 실측 5.9). 반대로 가중치가 작으면(구 8.0) 토큰별
+    # 분리를 배울 압력이 부족해 무사격 계획에도 사격 평균이 번진다 (run8: approach
+    # 상상 11 vs 라벨 평균 3.1). CEM 채점이 소비하는 건 기대 피해이므로 평균이 목표다.
     loss_dmg = masked_mean((outputs["ddmg"] - labels["ddmg"]).square())
     loss_ammo = masked_mean((outputs["dammo"] - labels["dammo"]).square())
     loss_heading = masked_mean((outputs["heading"] - labels["heading"]).square().sum(dim=-1))

@@ -31,8 +31,18 @@ from ..model.predictor import _Layer
 
 NUM_MISSION_TYPES = 4
 NUM_GEOMETRY = 8
-# objective_gap 정규화 기준 (구 관례: 관측거리 10유닛)
-OBJECTIVE_GAP_SCALE = 10.0
+# reach 성분의 자 길이 (유닛). 이 거리 밖은 원식이 음수 → clamp 0으로 뭉개진다.
+#
+# 구 시스템은 10(관측거리)이었다 — 에피소드 "끝 상태"만 채점했고 끝 상태 거리가
+# 2.3~4유닛에 몰려 있어 근거리 확대가 옳았다. 우리는 매 6초, 모든 거리의 상태를
+# 채점하므로 10이면 스폰~중반(11유닛 밖)에서 전 후보가 동점 0이 되어 CEM이
+# 제비뽑기가 된다 (wm2_loop2에서 gain=+0.000 연발로 실측). 맵 폭 40으로 늘려
+# 전 구간에서 "가까워지면 점수가 오르는" 단조성을 확보한다. 선형 = 모든 1유닛
+# 등가(형태 prior 없음). 근거리 변별이 무뎌지는 대가는 hold_objective 지표로
+# 감시하고, 필요가 실측되면 그때 비선형 자를 검토한다.
+#
+# 이 값이 바뀌면 V 라벨의 의미가 바뀐다 — V 재학습 필수.
+OBJECTIVE_GAP_SCALE = 40.0
 
 
 @dataclass(frozen=True)

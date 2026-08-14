@@ -39,7 +39,8 @@ class MaskConfig:
 class LossConfig:
     """설계 8절. 전부 frame a 기준 누적 잔차."""
     position: float = 3.0            # L1
-    damage: float = 8.0              # MSE
+    damage: float = 64.0             # MSE. 8→32→64 스윕 중 (근거는 losses.py 주석.
+                                     # run11=32: close 1.1×로 복원, hold 2.1×·approach 재상승 잔존)
     ammo: float = 1.0                # MSE
     heading: float = 1.0             # MSE (절대 cos,sin)
     completion: float = 1.0          # BCE

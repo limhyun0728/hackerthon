@@ -181,6 +181,10 @@ def main() -> None:
         help="counterfactual.py가 만든 npz glob. 무리한 계획의 실행 의미론 커버리지 (2b)",
     )
     parser.add_argument(
+        "--cf-repeat", type=int, default=1,
+        help="CF window 그룹 반복 계수 — rule 데이터 대비 실행 의미론의 gradient 비중 확대",
+    )
+    parser.add_argument(
         "--val-counterfactual-dirs",
         nargs="+",
         default=[],
@@ -238,10 +242,37 @@ def main() -> None:
                 if f.endswith(".npz")
             }
         )
-        cf_groups = [load_windows(Path(f)) for f in cf_files]
-        cf_groups = [g for g in cf_groups if g]
-        train_episodes += cf_groups
-        print(f"counterfactual groups={len(cf_groups)} windows={sum(len(g) for g in cf_groups)}")
+        # 교차 셋 중복 제거: 여러 CF 셋이 같은 에피소드의 같은 base tick을 뽑으면
+        # 결정적 패턴(hold/close/approach)의 계획이 똑같이 재생성된다 — run7 실측:
+        # loop3 교착대 hold/close 고유 404개 중 145개 2중, 37개 3중 수록. cf-repeat와
+        # 곱해져 특정 (상태, 계획)만 최대 6배 가중되어 상태 조건부 피해 평균을 끌어올렸다.
+        # 키 = (에피소드 npz 이름, anchor tick, 계획 토큰) — 먼저 온 셋의 창이 남는다.
+        seen_plans: set = set()
+        dropped = 0
+        cf_groups = []
+        for f in cf_files:
+            kept = []
+            for w in load_windows(Path(f)):
+                key = (Path(f).name, w.anchor_tick, hash(w.actions.tobytes()))
+                if key in seen_plans:
+                    dropped += 1
+                    continue
+                seen_plans.add(key)
+                kept.append(w)
+            if kept:
+                cf_groups.append(kept)
+        if dropped:
+            print(f"counterfactual 교차 중복 제거: {dropped} windows")
+        # 반복 계수: CF는 rule 대비 window 수가 1/10 수준이라 그대로 섞으면 실행
+        # 의미론(사거리·LOS 게이팅)의 gradient가 밀린다 (run5b: 표본 밀집 대역만 보정).
+        train_episodes += cf_groups * max(1, args.cf_repeat)
+        cf_windows = sum(len(g) for g in cf_groups)
+        rule_windows = sum(len(g) for g in train_episodes) - cf_windows * max(1, args.cf_repeat)
+        share = cf_windows * max(1, args.cf_repeat) / max(1, rule_windows + cf_windows * max(1, args.cf_repeat))
+        print(
+            f"counterfactual groups={len(cf_groups)} windows={cf_windows} "
+            f"repeat={max(1, args.cf_repeat)} -> 학습 비중 {share:.0%}"
+        )
     cf_val_groups = []
     if args.val_counterfactual_dirs:
         from ..data.counterfactual import load_windows as _load_cf
@@ -272,7 +303,8 @@ def main() -> None:
     weights = weights / weights.sum()
 
     checkpoint_dir = Path(args.output_root)
-    best_red_f2 = float("inf")
+    best_red_f2 = float("inf")   # 정체 판정 기준값 (min-delta 넘는 개선만 갱신)
+    best_saved_f2 = float("inf")  # wm2_best.pt에 실제 저장된 f2
     bad_checks = 0
     started = time.time()
 
@@ -318,11 +350,16 @@ def main() -> None:
                 "red_error_m": red_m.tolist(),
             }
             torch.save(payload, checkpoint_dir / "wm2_latest.pt")
+            # best 저장은 절대 개선이면 충분하다 — 검증 셋이 고정이고 eval이 결정적이라
+            # 측정 잡음이 없다. min-delta에 묶으면 느린 개선 구간에서 best가 동결된다
+            # (run5 실측: f2 2.7→2.6 개선이 저장 안 됨). min-delta는 아래 정체 판정 전용.
+            if red_m[1] < best_saved_f2:
+                best_saved_f2 = red_m[1]
+                torch.save(payload, checkpoint_dir / "wm2_best.pt")
             # early stopping: 게이트 지표(RED f2)가 min-delta 넘게 좋아져야 개선으로 인정
             if red_m[1] < best_red_f2 - args.early_stop_min_delta:
                 best_red_f2 = red_m[1]
                 bad_checks = 0
-                torch.save(payload, checkpoint_dir / "wm2_best.pt")
             else:
                 bad_checks += 1
             cf_text = ""
@@ -333,7 +370,7 @@ def main() -> None:
                 )
             print(
                 f"validation step={step} RED오차/정지가정(m): {table} "
-                f"best_f2={best_red_f2:.1f} bad={bad_checks}/{args.early_stop_patience}{cf_text}",
+                f"best_f2={best_saved_f2:.1f} bad={bad_checks}/{args.early_stop_patience}{cf_text}",
                 flush=True,
             )
             if args.early_stop_patience > 0 and bad_checks >= args.early_stop_patience:

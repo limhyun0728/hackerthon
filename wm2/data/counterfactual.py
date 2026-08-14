@@ -56,6 +56,22 @@ from .windows import (
 # 표본이 충분히 나온다. 표적은 사거리·LOS 무관 균등 — 그게 목적이다.
 ACTION_PROBS = {ACTION_STOP: 0.15, ACTION_MOVE: 0.40, ACTION_ENGAGE: 0.35, ACTION_TURN: 0.10}
 
+# 통제 패턴 혼합 비율 (v3). 무작위 계획만으로는 사수별 사거리의 인과가 분리되지 않는다
+# — 표적 하나에 여러 사수가 제각각 거리에서 붙어 "토큰 수 → 피해" 상관만 남는다
+# (실측: 전원 한계사거리 유지사격에 상상 112HP vs 실제 4.8HP, run4). 아래 패턴들은
+# 전대가 같은 조건이 되게 해 그 상관을 끊는 반례를 만든다:
+#   hold_fire      전원이 제자리에서 최근접 표적 사격 — 그 거리의 실제 화력을 그대로 라벨화
+#   close_fire     전원 3틱 접근 후 3틱 사격
+#   single_shooter 한 명만 사격, 나머지 정지 — 사수 1명의 거리-피해 인과를 순수 분리
+#   approach       전원 6틱 접근, 사격 없음 — "접근만으로는 피해 ~0"의 라벨화. run6
+#                  실측: 학습 패턴에 없던 approach만 9.0× 과대 (상상 2.6 vs 실측 0.3HP)
+# base tick마다 앞에서부터 candidates개를 고정 배치한다 (각 패턴 1개, 초과분은 random).
+# 확률 추첨을 안 쓰는 이유: hold/close/approach는 base tick이 정해지면 계획이 결정적
+# 이고 rollout도 후보 공통 시드라, 같은 패턴이 두 번 뽑히는 순간 창이 비트 단위로
+# 중복된다 (cf4 실측 125/1440쌍). 고정 배치는 중복을 없애고 같은 상태의 짝지은
+# 대조를 만든다. candidates=4는 approach 없이 기존 v3와 동일하게 동작한다.
+PATTERN_ORDER = ("random", "hold_fire", "close_fire", "single_shooter", "approach")
+
 
 def sample_plans(
     *,
@@ -64,6 +80,7 @@ def sample_plans(
     horizon: int,
     episode: Episode,
     base_tick: int,
+    patterns: tuple[str, ...] = PATTERN_ORDER,
 ):
     from ..sim.adapter import PlanSpec
 
@@ -86,10 +103,13 @@ def sample_plans(
     theta = rng.uniform(-math.pi, math.pi, size=(candidates, horizon, num_blue)).astype(np.float32)
     issued = np.zeros((candidates, horizon, num_blue), dtype=bool)
 
+    alive_slots: list[int] = []
+    nearest_red: dict[int, int] = {}
     for ui, uid in enumerate(blue_ids):
         state = frame[uid]
         if state.hp <= 0.0:
             continue
+        alive_slots.append(ui)
         issued[:, :, ui] = True
         # MOVE 목적지: 1틱 예산 안의 무작위 걸음을 스텝마다 이어붙인다 (규약과 동일 스케일)
         angles = rng.uniform(-math.pi, math.pi, size=(candidates, horizon))
@@ -100,6 +120,58 @@ def sample_plans(
         move_xy[:, :, ui, 1] = np.vectorize(norm_y)(state.y + dy)
         if red_alive:
             target_ids[:, :, ui] = rng.choice(red_alive, size=(candidates, horizon))
+            nearest_red[ui] = min(
+                red_alive,
+                key=lambda r: math.hypot(frame[r].x - state.x, frame[r].y - state.y),
+            )
+
+    # v3 통제 패턴: 후보별로 패턴을 골라 무작위 계획을 덮어쓴다 (PATTERN_ORDER 주석 참조).
+    # 표적은 전부 base_tick 기준 최근접 — 거리-피해 인과가 표적 선택 잡음과 섞이지 않게.
+    if red_alive and alive_slots:
+        picks = list(patterns[:candidates])
+        picks += ["random"] * (candidates - len(picks))
+        if len(alive_slots) == 1 and "single_shooter" in picks:
+            # 생존 BLUE 1명이면 single_shooter ≡ hold_fire — 같은 계획이 두 번 나와
+            # 공통 시드 rollout이 창을 비트 단위로 중복시킨다 (스모크 실측 6/200쌍)
+            picks[picks.index("single_shooter")] = "random"
+        half = horizon // 2
+        for c, pattern in enumerate(picks):
+            if pattern == "random":
+                continue
+            shooter = int(rng.choice(alive_slots)) if pattern == "single_shooter" else -1
+            for ui in alive_slots:
+                state = frame[blue_ids[ui]]
+                target = nearest_red[ui]
+                tgt = frame[target]
+                dist = math.hypot(tgt.x - state.x, tgt.y - state.y)
+                ux, uy = (
+                    ((tgt.x - state.x) / dist, (tgt.y - state.y) / dist)
+                    if dist > 1e-6 else (0.0, 0.0)
+                )
+
+                def waypoint(k: int) -> tuple[float, float]:
+                    advance = min((k + 1) * MAX_MOVE_PER_STEP, max(dist - 0.5, 0.0))
+                    return norm_x(state.x + ux * advance), norm_y(state.y + uy * advance)
+
+                if pattern == "hold_fire":
+                    types[c, :, ui] = ACTION_ENGAGE
+                    target_ids[c, :, ui] = target
+                elif pattern == "close_fire":
+                    for k in range(half):
+                        types[c, k, ui] = ACTION_MOVE
+                        move_xy[c, k, ui] = waypoint(k)
+                    types[c, half:, ui] = ACTION_ENGAGE
+                    target_ids[c, half:, ui] = target
+                elif pattern == "approach":
+                    for k in range(horizon):
+                        types[c, k, ui] = ACTION_MOVE
+                        move_xy[c, k, ui] = waypoint(k)
+                elif pattern == "single_shooter":
+                    if ui == shooter:
+                        types[c, :, ui] = ACTION_ENGAGE
+                        target_ids[c, :, ui] = target
+                    else:
+                        types[c, :, ui] = ACTION_STOP
 
     return PlanSpec(
         action_type_ids=types.astype(np.int64),
@@ -108,6 +180,16 @@ def sample_plans(
         theta_radians=theta,
         issued=issued,
     )
+
+
+def _min_contact(episode: Episode, tick: int) -> float | None:
+    """tick 시점 생존 BLUE-RED 최근접 거리 (유닛). 한쪽 전멸이면 None."""
+    frame = episode.frames[tick]
+    blues = [(frame[u].x, frame[u].y) for u in episode.blue_ids if frame[u].hp > 0.0]
+    reds = [(frame[u].x, frame[u].y) for u in episode.red_ids if frame[u].hp > 0.0]
+    if not blues or not reds:
+        return None
+    return min(math.hypot(bx - rx, by - ry) for bx, by in blues for rx, ry in reds)
 
 
 def _plan_action_tokens(plan, candidate: int, layout: EpisodeLayout, red_ids: tuple[int, ...]) -> np.ndarray:
@@ -333,6 +415,27 @@ def main() -> None:
     parser.add_argument("--per-episode", type=int, default=6, help="에피소드당 base tick 수")
     parser.add_argument("--candidates", type=int, default=4, help="base tick당 무작위 계획 수")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--shard-index", type=int, default=0,
+        help="병렬 생성용: 정렬된 에피소드 목록의 [index::count] 조각만 처리",
+    )
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument(
+        "--min-contact", type=float, default=0.0,
+        help="base tick 자격: 생존 BLUE-RED 최근접 거리 하한 (유닛). 계층화로도 "
+        "원거리 대역이 얇을 때(cf4 실측: ≥10u가 13%%) 원거리 전용 추가 생성용",
+    )
+    parser.add_argument(
+        "--max-contact", type=float, default=float("inf"),
+        help="base tick 자격: 접촉 거리 상한. min과 함께 특정 대역 전용 생성용 "
+        "(예: 7.5~10 교착대 — run6 잔여 결함인 상상 hold>close 역전의 표적 증강)",
+    )
+    parser.add_argument(
+        "--patterns", default=None,
+        help="쉼표 구분 패턴 목록으로 고정 배치를 대체 (예: approach,single_shooter,random). "
+        "사격:무사격 라벨 균형 보충용 (run7 실측: 교착대 사격 라벨 6.5:1 압도). "
+        "결정적 패턴(hold/close/approach)을 두 번 넣으면 창이 중복되니 반복은 random만",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -344,10 +447,18 @@ def main() -> None:
             if Path(d).is_dir()
         }
     )
+    dirs = dirs[args.shard_index :: args.shard_count]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
+    # 샤드마다 다른 시드 — 같은 시드로 다른 에피소드를 돌려도 무방하지만 명시가 안전하다
+    rng = np.random.default_rng(args.seed + args.shard_index)
     signatures = heldout_signatures()
+    patterns = PATTERN_ORDER
+    if args.patterns:
+        patterns = tuple(p.strip() for p in args.patterns.split(","))
+        unknown = set(patterns) - set(PATTERN_ORDER)
+        if unknown:
+            raise SystemExit(f"모르는 패턴: {sorted(unknown)} (가능: {PATTERN_ORDER})")
 
     from tqdm import tqdm
 
@@ -368,15 +479,36 @@ def main() -> None:
         # 홀수 틱에서 시작하면 원 세계와 위상이 반전된 미래를 만들어 RED 레이블이
         # 계통적으로 오염된다 (실측: 반전 시 t+2 오차 2.6→11.5m).
         valid = [t for t in ticks if t - 3 >= ticks[0] and t % 2 == 0]
-        if len(valid) < args.per_episode:
+        # 거리 계층화 표집: base tick을 접촉 거리 대역별로 고루 뽑는다. 자연 표집은
+        # 에피소드가 오래 머무는 거리(rule=근접, loop=교착대)로 쏠리는데, 모델에겐
+        # 사격확률 계단(4/7/10u 경계) 전 구간의 계획-결과 표본이 필요하다
+        # (run5b 3대역 프로브: 4~7u 배율 2.2×, 7.5~10u 8.9×, 10~14u 84× —
+        #  표본이 있는 대역만 보정된다).
+        by_band: dict[int, list[int]] = {}
+        for t in valid:
+            distance = _min_contact(episode, t)
+            if distance is None or not (args.min_contact <= distance <= args.max_contact):
+                continue
+            band = sum(distance >= edge for edge in (4.0, 7.0, 10.0, 14.0))
+            by_band.setdefault(band, []).append(t)
+        pools = [rng.permutation(band).tolist() for band in by_band.values()]
+        base_ticks: list[int] = []
+        while pools and len(base_ticks) < args.per_episode:
+            for pool in list(pools):
+                if len(base_ticks) >= args.per_episode:
+                    break
+                base_ticks.append(int(pool.pop()))
+                if not pool:
+                    pools.remove(pool)
+        if not base_ticks:
             continue
-        base_ticks = sorted(rng.choice(valid, size=args.per_episode, replace=False).tolist())
+        base_ticks.sort()
 
         episode_windows: list[Window] = []
         for base_tick in base_ticks:
             plan = sample_plans(
                 rng=rng, candidates=args.candidates, horizon=PRED_FRAMES,
-                episode=episode, base_tick=base_tick,
+                episode=episode, base_tick=base_tick, patterns=patterns,
             )
             units = rollout(
                 episode=episode, base_tick=base_tick, plan=plan,

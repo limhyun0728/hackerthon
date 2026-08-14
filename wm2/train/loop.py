@@ -77,6 +77,45 @@ def _samples_from_pairs(pairs, layout: EpisodeLayout) -> EpisodeSamples | None:
     )
 
 
+def _save_episode_dir(root: Path, name: str, result, scenario: dict, lam: float, seed: int) -> None:
+    """구 에피소드 디렉터리와 같은 형식으로 저장 — 기존 분석·렌더링 도구 호환.
+
+    planned_log.csv가 새로 추가된다 (설계 14절 미결 해소: 계획 명령 별도 기록).
+    """
+    import csv
+
+    run_dir = root / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    config = dict(scenario)
+    config.update({"controller": "wm2_cem_loop", "lam": lam, "seed": seed})
+    (run_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False))
+
+    with (run_dir / "soldier_log.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "id", "x", "y", "heading", "hp", "ammo", "mode", "target_id"])
+        for t in sorted(result.raw_frames):
+            if abs(t - round(t)) > 1e-6:
+                continue
+            for uid in sorted(result.raw_frames[t]):
+                r = result.raw_frames[t][uid]
+                writer.writerow([t, uid, r["x"], r["y"], r["heading"], r["hp"], r["ammo"],
+                                 r.get("mode", ""), r.get("target_id", "")])
+
+    with (run_dir / "commands_log.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "unit_id", "role", "action", "detail", "reason"])
+        for c in result.executed_commands:
+            writer.writerow([c["tick"], c["unit_id"], "CEM", c["action"],
+                             c.get("detail", ""), c.get("reason", "")])
+
+    with (run_dir / "planned_log.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["tick", "unit_id", "step", "action", "target", "target_id"])
+        for p in result.planned_commands:
+            writer.writerow([p["tick"], p["unit_id"], p["step"], p["action"],
+                             p.get("target", ""), p.get("target_id", "")])
+
+
 def _finetune_value(value_head, buffer, device, *, steps, lr, rng):
     optimizer = torch.optim.AdamW(value_head.parameters(), lr=lr, weight_decay=1e-4)
     weights = np.asarray([len(s.labels) for s in buffer], dtype=np.float64)
@@ -165,6 +204,10 @@ def main() -> None:
             totals[lam] += 1
             if result.outcome == "WIN":
                 wins[lam] += 1
+            _save_episode_dir(
+                output_root, f"episode_p{pair_index:03d}_lam{int(lam)}",
+                result, scenario, lam, episode_seed,
+            )
             is_holdout = pair_index % 5 == 4
             for p in result.v_pairs:
                 if p.label is None:

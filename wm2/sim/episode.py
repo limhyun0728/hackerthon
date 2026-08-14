@@ -75,6 +75,7 @@ class VPair:
 @dataclass
 class EpisodeResult:
     frames: dict[int, dict[int, UnitState]]
+    raw_frames: dict[float, dict[int, dict]]   # soldier_log 형식 저장용 (mode/target 포함)
     executed_commands: list[dict]
     planned_commands: list[dict]
     v_pairs: list[VPair]
@@ -123,7 +124,11 @@ class CEMCommanderAtomic(AtomicDEVS):
     def extTransition(self, inputs):
         if self.status_in in inputs:
             for status in inputs[self.status_in]:
-                row = {k: status[k] for k in ("time", "id", "x", "y", "heading", "hp", "ammo")}
+                # mode/target_id는 soldier_log 형식 호환용으로 함께 보관한다
+                row = {
+                    k: status.get(k, "")
+                    for k in ("time", "id", "x", "y", "heading", "hp", "ammo", "mode", "target_id")
+                }
                 self.frames.setdefault(round(float(row["time"]), 2), {})[int(row["id"])] = row
         latest = self._latest_complete()
         if latest is not None and latest not in self._commanded and latest < self.duration - 0.5:
@@ -523,12 +528,10 @@ def run_cem_episode(
 
     progress_by_tick = {t: _progress(states, layout) for t, states in sorted(frames.items())}
     last = max(frames)
-    completed_ticks = [t for t, p in progress_by_tick.items() if p >= 1.0 - 1e-6]
     blue_alive_end = any(frames[last][u].hp > 0 for u in blue_ids if u in frames[last])
-    if layout.mission_type == MISSION_HOLD_OBJECTIVE:
-        outcome = "WIN" if progress_by_tick[last] >= 1.0 - 1e-6 else ("LOSE" if not blue_alive_end else "TIMEOUT")
-    else:
-        outcome = "WIN" if completed_ticks else ("LOSE" if not blue_alive_end else "TIMEOUT")
+    # 승패는 최종 프레임 기준 — 구 시스템(evaluate_fixed_batch._combat_outcome)과 동일 관점.
+    # 순간 터치(completed_ticks) 판정은 터치 후 전멸을 WIN으로 세는 부풀림이 있었다.
+    outcome = "WIN" if progress_by_tick[last] >= 1.0 - 1e-6 else ("LOSE" if not blue_alive_end else "TIMEOUT")
 
     # V 짝 라벨: progress(t+21) − progress(t+6), 종료 clamp
     for pair in bridge.v_pairs:
@@ -543,6 +546,7 @@ def run_cem_episode(
     )
     return EpisodeResult(
         frames=frames,
+        raw_frames=raw_frames,
         executed_commands=bridge.executed_log,
         planned_commands=bridge.planned_log,
         v_pairs=bridge.v_pairs,

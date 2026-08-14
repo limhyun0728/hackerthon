@@ -25,7 +25,10 @@ from torch.nn import functional as F
 
 from ..config import ModelConfig
 from .encoder import ActionEncoder, BlockSlotEncoder
-from .features import block_layout
+from .features import MAX_RED_SLOTS, NUM_ACTION_TYPES, block_layout
+
+# 액션 특징 안의 표적 onehot 위치 ([issued|type4|move2|target10|turn2])
+_TARGET_SLICE = slice(1 + NUM_ACTION_TYPES + 2, 1 + NUM_ACTION_TYPES + 2 + MAX_RED_SLOTS)
 
 HISTORY_FRAMES = 3
 PRED_FRAMES = 6
@@ -87,6 +90,19 @@ class WM2Predictor(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         self.time_embedding = nn.Embedding(TOTAL_FRAMES, dim)
         self.anchor_proj = nn.Linear(dim, dim)
+        # 액션 노드에 발신자(사수) identity를 얹는 투영. 이게 없으면 같은 틱·같은
+        # 표적의 ENGAGE 토큰이 사수 불문 동일해져, 표적 피해 예측이 사수별 사거리를
+        # 조회할 수 없다 — "전원 한계사거리 유지사격"에 73HP를 상상하던 귀속 실패의
+        # 원인 (실측: 상상 73 vs DEVS 4.8). MOVE는 목적지 좌표로 자가결합돼 무사했다.
+        id_dim = self.layout["identity"].stop - self.layout["identity"].start
+        self.action_identity = nn.Linear(id_dim, dim)
+        # 표적 주소: ENGAGE onehot을 표적 유닛의 identity 임베딩(같은 테이블)로 번역해
+        # 액션 토큰에 더한다. onehot→MLP만으로는 유닛 토큰의 identity와 좌표계가 달라
+        # 대응을 학습으로 번역해야 하는데, 결합은 구조로 보장한다 (사수 서명과 같은 원리,
+        # 역할 구분을 위해 별도 투영).
+        # bias 없음: 표적 onehot이 전부 0인 액션(MOVE/STOP/TURN)에는 정확히 0이
+        # 더해진다 — 표적 주소는 ENGAGE 토큰에만 존재한다.
+        self.target_identity = nn.Linear(id_dim, dim, bias=False)
         self.layers = nn.ModuleList(
             _Layer(dim, config.hidden_dim, config.num_heads, config.dropout)
             for _ in range(config.num_layers)
@@ -156,10 +172,21 @@ class WM2Predictor(nn.Module):
         per_frame = torch.cat([unit_tokens, mission_tokens.unsqueeze(2)], dim=2)
         queries = per_frame.reshape(b, TOTAL_FRAMES * (num_units + 1), dim)
 
-        # 정적 KV: 지형 + 액션 노드(발행틱 시간 임베딩 부여)
-        action_flat = (action_nodes + time_emb[:ACTION_TICKS].reshape(1, ACTION_TICKS, 1, dim)).reshape(
-            b, -1, dim
-        )
+        # 정적 KV: 지형 + 액션 노드(발행틱 시간 + 사수 서명 + 표적 주소)
+        num_blue = actions.shape[2]
+        all_identity = self.encoder.unit_identity(team_ids)               # (U, id_dim)
+        shooter_identity = self.action_identity(
+            all_identity[:num_blue]
+        ).reshape(1, 1, num_blue, dim)
+        red_identity = all_identity[num_blue:]                            # (R, id_dim) — layout은 blue 先
+        target_onehot = actions[..., _TARGET_SLICE][..., : red_identity.shape[0]]
+        target_address = self.target_identity(target_onehot @ red_identity)  # (B, 8, Ub, D)
+        action_flat = (
+            action_nodes
+            + time_emb[:ACTION_TICKS].reshape(1, ACTION_TICKS, 1, dim)
+            + shooter_identity
+            + target_address
+        ).reshape(b, -1, dim)
         static_kv = torch.cat([terrain, action_flat], dim=1)
 
         visible = self._visibility(
