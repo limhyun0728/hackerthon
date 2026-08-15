@@ -1,16 +1,21 @@
-"""후보 채점 (설계 10절, 합의된 순수 progress 형태).
+"""후보 채점 (설계 10절 + 2026-08-15 레버 2: 생존 항).
 
-score(후보) = [progress(ŝ₆) − progress(s₀)] + λ·V(ŝ₆)
+score(후보) = [progress(ŝ₆) − progress(s₀)] + β·[H(ŝ₆) − H(s₀)] + λ·V(ŝ₆)
 
-- 첫 항: 상상된 상태에 승리 조건의 연속 완화(progress)를 그대로 계산 — 손가중치 없음
-- V: 그 상태에서 이어질 15초의 progress 증가분 예측 (학습)
-- 모든 후보가 같은 s₀에서 출발하므로 progress(s₀)는 순위에 영향 없는 공통 상수
+- progress 항: 상상된 상태에 승리 조건의 연속 완화를 그대로 계산 — 손가중치 없음
+- 생존 항 (β=SURVIVAL_BETA): H = 아군 HP 합 / (아군 수·MAX_HP). 최종 판정이 생존+완료를
+  요구하는데 progress는 완료만 봐서, 창 안의 출혈이 채점상 공짜였다 (100쌍×3런 실측:
+  V 팔이 λ=0의 최종 승리 10을 2~4로 깎은 원인). λ=0 팔도 이 항은 받는다 — 목적함수
+  자체의 수리이지 V의 기능이 아니다.
+- V: ŝ₆부터 에피소드 끝까지의 γ-할인 잔여 보상(rtg) 예측 — 같은 δ 정의로 학습
+- 모든 후보가 같은 s₀에서 출발하므로 s₀ 항들은 순위에 영향 없는 공통 상수
 """
 
 from __future__ import annotations
 
 import torch
 
+from ..config import SURVIVAL_BETA
 from ..model.features import (
     MAX_AMMO,
     MAX_HP,
@@ -127,7 +132,11 @@ def score_candidates(
         team_ids, mission_type, objective,
     )
     progress_end = progress_batch(positions[:, -1], hp[:, -1], team_ids, mission_type, objective)
-    gain = progress_end - progress_now
+    blue = (team_ids == int(TeamId.BLUE)).float()
+    denom = (blue.sum() * MAX_HP).clamp_min(1.0)
+    survival_now = (current_hp * blue).sum() / denom
+    survival_end = (hp[:, -1] * blue.reshape(1, -1)).sum(dim=1) / denom
+    gain = (progress_end - progress_now) + SURVIVAL_BETA * (survival_end - survival_now)
 
     value = torch.zeros_like(gain)
     if value_head is not None and lam != 0.0:

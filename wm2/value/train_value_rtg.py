@@ -39,16 +39,27 @@ import numpy as np
 import torch
 
 from . import train_value as tv
+from ..config import SURVIVAL_BETA, VALUE_GAMMA
+from ..model.features import MAX_HP
 from .head import WM2ValueHead, save_value_head
 
 
-def _rtg_by_tick(episode, gamma: float) -> dict[int, float]:
-    """진행도 return-to-go: rtg[t] = Σ_{k≥t} γ^{k−t}·(p[k+1]−p[k]), 끝에서 0."""
+def _rtg_by_tick(episode, gamma: float, beta: float) -> dict[int, float]:
+    """보상 return-to-go: δ = Δprogress + β·Δ(아군 HP 비율), rtg[t] = δ_t + γ·rtg[t+1].
+
+    생존 항(2026-08-15 레버 2): 최종 판정(생존+완료)의 형상을 라벨이 갖게 한다.
+    β=0이면 순수 진행도 rtg (ablation용).
+    """
     ticks = sorted(episode.ticks)
     p = {t: tv.episode_progress(episode, t) for t in ticks}
+    denom = max(len(episode.blue_ids), 1) * MAX_HP
+    h = {
+        t: sum(episode.frames[t][u].hp for u in episode.blue_ids if u in episode.frames[t]) / denom
+        for t in ticks
+    }
     rtg = {ticks[-1]: 0.0}
     for a, b in zip(reversed(ticks[:-1]), reversed(ticks[1:])):
-        rtg[a] = (p[b] - p[a]) + gamma * rtg[b]
+        rtg[a] = (p[b] - p[a]) + beta * (h[b] - h[a]) + gamma * rtg[b]
     return rtg
 
 
@@ -73,14 +84,14 @@ def _label_ticks_imagined(episode) -> list[int]:
     ]
 
 
-def _relabel(samples: tv.EpisodeSamples, episode, *, gamma: float,
+def _relabel(samples: tv.EpisodeSamples, episode, *, gamma: float, beta: float,
              imagined: bool, tail_exclude: int) -> tv.EpisodeSamples | None:
     ticks = _label_ticks_imagined(episode) if imagined else _label_ticks_real(episode)
     assert len(ticks) == len(samples.labels), (
         f"라벨 시각 재현 불일치: {len(ticks)} vs {len(samples.labels)} — "
         "train_value.py의 표본 인덱싱이 바뀌었는지 확인"
     )
-    rtg = _rtg_by_tick(episode, gamma)
+    rtg = _rtg_by_tick(episode, gamma, beta)
     labels = np.asarray([rtg[t] for t in ticks], dtype=np.float32)
     keep = np.asarray([episode.ticks[-1] - t >= tail_exclude for t in ticks])
     if not keep.any():
@@ -94,7 +105,7 @@ def _relabel(samples: tv.EpisodeSamples, episode, *, gamma: float,
     )
 
 
-def load_samples_rtg(patterns, *, gamma: float, imagined, tail_exclude: int):
+def load_samples_rtg(patterns, *, gamma: float, beta: float, imagined, tail_exclude: int):
     from tqdm import tqdm
 
     from ..data.episodes import load_episode
@@ -117,7 +128,7 @@ def load_samples_rtg(patterns, *, gamma: float, imagined, tail_exclude: int):
         if samples is None:
             continue
         samples = _relabel(
-            samples, episode, gamma=gamma,
+            samples, episode, gamma=gamma, beta=beta,
             imagined=imagined is not None, tail_exclude=tail_exclude,
         )
         if samples is not None:
@@ -129,7 +140,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episode-dirs", nargs="+", required=True)
     parser.add_argument("--validation-dirs", nargs="+", default=["output/validation_shared_v2/episode_*"])
-    parser.add_argument("--gamma", type=float, default=0.97, help="틱당 할인율 (반감기 ~23틱)")
+    parser.add_argument("--gamma", type=float, default=VALUE_GAMMA, help="틱당 할인율 (반감기 ~23틱)")
+    parser.add_argument("--survival-beta", type=float, default=SURVIVAL_BETA,
+                        help="δ = Δprogress + β·Δ아군HP비율. 0이면 순수 진행도 rtg (ablation)")
     parser.add_argument("--tail-exclude", type=int, default=0,
                         help="에피소드 끝에서 N틱 미만 남은 표본 제외 (기본 0 — 위 docstring 근거)")
     parser.add_argument("--world-model-checkpoint", default=None,
@@ -160,15 +173,17 @@ def main() -> None:
         print(f"상상 입력 모드: ŝ_(t+6) 입력, 라벨 = γ={args.gamma} return-to-go")
 
     train_samples = load_samples_rtg(
-        args.episode_dirs, gamma=args.gamma, imagined=imagined, tail_exclude=args.tail_exclude
+        args.episode_dirs, gamma=args.gamma, beta=args.survival_beta,
+        imagined=imagined, tail_exclude=args.tail_exclude,
     )
     val_samples = load_samples_rtg(
-        args.validation_dirs, gamma=args.gamma, imagined=imagined, tail_exclude=args.tail_exclude
+        args.validation_dirs, gamma=args.gamma, beta=args.survival_beta,
+        imagined=imagined, tail_exclude=args.tail_exclude,
     )
     print(
         f"train episodes={len(train_samples)} samples={sum(len(s.labels) for s in train_samples)} | "
         f"val episodes={len(val_samples)} samples={sum(len(s.labels) for s in val_samples)} | "
-        f"γ={args.gamma} tail_exclude={args.tail_exclude}"
+        f"γ={args.gamma} β={args.survival_beta} tail_exclude={args.tail_exclude}"
     )
 
     model = WM2ValueHead().to(device)
@@ -202,7 +217,7 @@ def main() -> None:
             if metrics["mae"] < best_mae:
                 best_mae = metrics["mae"]
                 save_value_head(Path(args.output), model)
-    print(f"done best_val_mae={best_mae:.4f} γ={args.gamma} → {args.output}")
+    print(f"done best_val_mae={best_mae:.4f} γ={args.gamma} β={args.survival_beta} → {args.output}")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,15 @@ class LossConfig:
     completion: float = 1.0          # BCE
 
 
+# ── 보상 정의 상수 (2026-08-15 레버 2: 판정 기준과 목적함수 정합) ─────────────
+# 보상 δ_t = Δprogress_t + SURVIVAL_BETA·Δ(아군 HP 비율)_t.
+# β=1 논거: 분대 전멸(ΔH=−1)의 비용 = 임무 전체 가치(+1) — "다 죽고 완수"는 본전,
+# "살아서 완수"는 엄밀 우위. 최종 판정(생존+완료)의 형상을 밀도 있는 보상으로 옮긴 것.
+# 세 소비처(train_value_rtg 라벨, score.py gain, episode.py 온라인 라벨)가 공유한다.
+VALUE_GAMMA = 0.97       # rtg 할인율/틱 (반감기 ~23틱). CEM의 V 가중은 γ^HORIZON≈0.83
+SURVIVAL_BETA = 1.0
+
+
 @dataclass(frozen=True)
 class ScoreConfig:
     """설계 10절. score = Σ(보상) + lam·V(끝 프레임)."""
@@ -68,6 +77,10 @@ class CEMConfig:
     horizon: int = 6
     goal_directed: bool = True
     goal_temperature_range: tuple[float, float] = (0.1, 0.5)
+    # 상상 feasibility 마스크 (2026-08-14): 상상 궤적상 실행 불가능한 ENGAGE(사거리·LOS·
+    # 표적 생존 전부 불통과)가 든 후보를 elite 선발에서 배제. 실행층 _feasible_target의
+    # 계획측 미러 — 팬텀 원거리 사격 복권을 채점 전에 끊는다.
+    imagined_feasibility_mask: bool = True
 
 
 @dataclass(frozen=True)

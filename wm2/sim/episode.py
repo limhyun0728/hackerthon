@@ -425,6 +425,7 @@ def run_cem_episode(
     device, lam: float, seed: int,
     duration: float = 60.0,
     label: str = "",
+    survival_beta: float | None = None,   # None이면 config.SURVIVAL_BETA — β ablation용 오버라이드
 ) -> EpisodeResult:
     obstacles = [tuple(r) for r in scenario["obstacles"]]
     blue_ids = sorted(int(v) for v in scenario["blue_ids"])
@@ -533,11 +534,28 @@ def run_cem_episode(
     # 순간 터치(completed_ticks) 판정은 터치 후 전멸을 WIN으로 세는 부풀림이 있었다.
     outcome = "WIN" if progress_by_tick[last] >= 1.0 - 1e-6 else ("LOSE" if not blue_alive_end else "TIMEOUT")
 
-    # V 짝 라벨: progress(t+21) − progress(t+6), 종료 clamp
+    # V 짝 라벨: γ-할인 return-to-go, δ = Δprogress + β·Δ아군HP비율 —
+    # train_value_rtg·score.py와 동일 정의/상수(config). 온라인 갱신이 rtg+생존 V를
+    # 다른 의미의 라벨로 끌어가지 않도록 정합을 유지한다.
+    from ..config import SURVIVAL_BETA, VALUE_GAMMA
+    from ..model.features import MAX_HP
+
+    beta = SURVIVAL_BETA if survival_beta is None else survival_beta
+    hp_denom = max(len(blue_ids), 1) * MAX_HP
+    h_by_tick = {
+        t: sum(states[u].hp for u in blue_ids if u in states) / hp_denom
+        for t, states in frames.items()
+    }
+    ticks_sorted = sorted(progress_by_tick)
+    rtg = {ticks_sorted[-1]: 0.0}
+    for a, b in zip(reversed(ticks_sorted[:-1]), reversed(ticks_sorted[1:])):
+        rtg[a] = (
+            (progress_by_tick[b] - progress_by_tick[a])
+            + beta * (h_by_tick[b] - h_by_tick[a])
+            + VALUE_GAMMA * rtg[b]
+        )
     for pair in bridge.v_pairs:
-        t6 = min(pair.tick + 6, last)
-        t21 = min(pair.tick + 21, last)
-        pair.label = progress_by_tick[t21] - progress_by_tick[t6]
+        pair.label = rtg[min(pair.tick + 6, last)]
 
     print(
         f"{label} 종료: {outcome} progress={progress_by_tick[last]:.3f} "

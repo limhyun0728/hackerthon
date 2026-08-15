@@ -126,7 +126,18 @@ def main() -> None:
         )
         pairs.append((s, i, adv))
 
-    print(f"\n게이트: 평균 ΔV ≥ +{GATE_MEAN} 그리고 양수 ≥ {GATE_POS:.0%}\n")
+    # 병력비: 생존 BLUE 수 vs 생존 RED 수 (생존 라벨 V의 열세 회피 게이트용)
+    ratios = []
+    for s, i, _ in pairs:
+        uf = s.unit_features[i]
+        alive = uf[:, ALIVE] > 0.5
+        blue = np.asarray(s.team_ids) == int(TeamId.BLUE)
+        ratios.append((alive & blue).sum() / max((alive & ~blue).sum(), 1))
+    ratios = np.asarray(ratios)
+    up = ratios >= 1.0   # 우세·동수 vs 열세
+
+    print(f"\n참고 게이트(구 라벨 기준): 평균 ΔV ≥ +{GATE_MEAN} 그리고 양수 ≥ {GATE_POS:.0%}")
+    print(f"병력비 분해: 우세·동수 {int(up.sum())}개 / 열세 {int((~up).sum())}개\n")
     for ckpt in args.value_checkpoints:
         model = load_value_head(Path(ckpt), device)
         model.eval()
@@ -138,9 +149,11 @@ def main() -> None:
                 deltas.append(moved - base)
         deltas = np.asarray(deltas)
         mean, med, pos = deltas.mean(), np.median(deltas), (deltas > 0).mean()
-        verdict = "통과" if (mean >= GATE_MEAN and pos >= GATE_POS) else "탈락"
-        print(f"{Path(ckpt).name:<28} ΔV 평균 {mean:+.4f} 중앙값 {med:+.4f} "
-              f"양수 {pos:.0%}  → {verdict}")
+        d_up, d_dn = deltas[up], deltas[~up]
+        split = ""
+        if len(d_up) and len(d_dn):
+            split = f" | 우세 {d_up.mean():+.4f}({(d_up>0).mean():.0%}+) 열세 {d_dn.mean():+.4f}({(d_dn>0).mean():.0%}+)"
+        print(f"{Path(ckpt).name:<28} ΔV 평균 {mean:+.4f} 중앙값 {med:+.4f} 양수 {pos:.0%}{split}")
 
 
 if __name__ == "__main__":
