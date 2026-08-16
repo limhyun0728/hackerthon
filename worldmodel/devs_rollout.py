@@ -373,10 +373,10 @@ class _RolloutBattleModel(CoupledDEVS):
                 if port is not None:
                     self.connectPorts(port, soldier.command_in)
             else:
-                policy = UrbanRedPolicy(
-                    target_type="soldier",
+                from hackerthon.red_variants import build_red_policy
+                policy = build_red_policy(
+                    red_target_priority,
                     obstacles=snapshot.obstacles,
-                    target_priority=red_target_priority,
                 )
                 saved = (red_policy_states or {}).get(unit_id)
                 if saved:

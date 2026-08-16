@@ -37,6 +37,7 @@ from pypdevs.simulator import Simulator  # noqa: E402
 
 from hackerthon.simulation_direct_commander_5v5 import CSVLoggerAtomic, RulePolicyAtomic  # noqa: E402
 from hackerthon.red_policy import UrbanRedPolicy  # noqa: E402
+from hackerthon.red_variants import build_red_policy as _build_red_policy  # noqa: E402
 from hackerthon.sim_units import LosSoldierAtomic, LosWorldAtomic  # noqa: E402
 from hackerthon.terrain import (  # noqa: E402
     DEFAULT_OBSTACLES,
@@ -840,8 +841,10 @@ class CEMCommanderAtomic(AtomicDEVS):
             raise ValueError("policy_prior_mix는 [0, 1] 범위여야 한다")
         # 초반에는 기본 CEM prior를 더 섞어 사격/정지 탐색이 policy 편향에 눌리지 않게 한다.
         self.policy_prior_mix = float(policy_prior_mix)
-        if red_target_priority not in ("nearest", "low_hp", "smart"):
-            raise ValueError("red_target_priority는 nearest, low_hp 또는 smart여야 한다")
+        if red_target_priority not in ("nearest", "low_hp", "smart", "assault", "ambush", "kite"):
+            raise ValueError(
+                "red_target_priority는 nearest/low_hp/smart 또는 교리 변형 assault/ambush/kite여야 한다"
+            )
         self.red_target_priority = red_target_priority
         self.controlled_ids = tuple(int(unit_id) for unit_id in controlled_ids)
         self.all_unit_ids = tuple(int(unit_id) for unit_id in all_unit_ids)
@@ -1255,10 +1258,9 @@ class CEMCommanderAtomic(AtomicDEVS):
             }
             # 후보 rollout용 RED token은 후보 state에서 rule을 즉시 평가한 외생 반응이다.
             command = dict(
-                UrbanRedPolicy(
-                    target_type="soldier",
+                _build_red_policy(
+                    self.red_target_priority,
                     obstacles=self.obstacles,
-                    target_priority=self.red_target_priority,
                     lane_seed=self.episode_seed,
                     assault_target=self._red_assault_target(),
                 ).decide(observation)
@@ -1888,12 +1890,12 @@ class CEMEpisodeBattleModel(CoupledDEVS):
             brain = self.addSubModel(
                 RulePolicyAtomic(
                     name=f"Red_Rule_{unit_id}",
-                    policy=UrbanRedPolicy(
-                        target_type="soldier",
+                    policy=_build_red_policy(
+                        red_target_priority,
                         obstacles=obstacles,
-                        target_priority=red_target_priority,
                         lane_seed=seed,
-                        # BLUE가 거점을 지키는 임무일 때만 RED가 공격측이 된다.
+                        # BLUE가 거점을 지키는 임무일 때만 RED가 공격측이 된다
+                        # (assault 변형은 팩토리에서 BLUE 진영 목표로 대체).
                         assault_target=(
                             objective if mission_type == MISSION_HOLD_OBJECTIVE else None
                         ),
@@ -2388,9 +2390,10 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--red-target-priority",
-        choices=("nearest", "low_hp", "smart"),
+        choices=("nearest", "low_hp", "smart", "assault", "ambush", "kite"),
         default="nearest",
-        help="RED rule target 선택. nearest는 가장 가까운 BLUE, low_hp는 부상당한 BLUE, smart는 처치 가능성과 방어선을 함께 본다",
+        help="RED rule target 선택(nearest/low_hp/smart) 또는 교리 변형 — assault: 전면 공세, "
+             "ambush: 제자리 매복, kite: 쏘고 빠지기 (월드모델 상대 정책 민감도 실험용)",
     )
     parser.add_argument(
         "--cem-horizon",
