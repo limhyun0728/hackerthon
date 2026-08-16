@@ -132,6 +132,7 @@ def make_devs_planner(duration_sec: float, obstacles: tuple):
             features = rollout_plans_with_devs(
                 plans=plans, snapshot=snapshot,
                 seed=int(rng.integers(1 << 31)), device=torch.device("cpu"),
+                blue_max_step=1.0,   # 본게임 물리 (전원 1.0) — ours 팔과의 공정 비교 조건
             )
             arr = features.detach().cpu().numpy() if isinstance(features, torch.Tensor) else np.asarray(features)
             units = arr[:, :, :num_units, :]

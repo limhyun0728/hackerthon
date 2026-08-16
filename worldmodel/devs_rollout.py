@@ -304,6 +304,16 @@ class _RolloutBattleModel(CoupledDEVS):
         plan: _CandidatePlan,
         horizon: int,
         red_target_priority: str = "nearest",
+        # BLUE 1틱 이동 상한. 기본 1.5는 구 CEM 규약(기존 CF 데이터 재현성 보존).
+        # 본게임 심은 전원 1.0이므로, 실전 물리로 굴려야 하는 호출부(지휘 플랫폼의
+        # 전개·cem+devs 러너)는 1.0을 명시할 것 — 1.5로 두면 BLUE가 RED보다 1.5배
+        # 빨라 추격이 안 붙고 "RED가 못 싸우는" 왜곡이 생긴다 (2026-08-15 실측).
+        blue_max_step: float = 1.5,
+        # RED 두뇌 상태 승계 (last_seen, search_index). 6틱 구간을 이어붙이는 지휘
+        # 플랫폼 전개에서 매 구간 새 모델을 만들면 RED가 추격 기억을 잃고 순찰을
+        # 처음부터 다시 시작한다 — 풀심(연속 60초)의 RED보다 훨씬 무르게 싸우는
+        # 원인 2 (episode.py 상단 주석의 "chained rollout ≠ 학습 분포" 그 문제).
+        red_policy_states: dict | None = None,
     ):
         super().__init__("RolloutBattleModel")
         alive_rows = [row for row in snapshot.unit_rows if float(row["hp"]) > 0.0]
@@ -351,7 +361,7 @@ class _RolloutBattleModel(CoupledDEVS):
                     ammo=int(row["ammo"]),
                     fov_deg=120.0,
                     obstacles=snapshot.obstacles,
-                    **({"max_move_per_step": 1.5} if is_blue else {"turn_to_damage": True}),
+                    **({"max_move_per_step": blue_max_step} if is_blue else {"turn_to_damage": True}),
                 )
             )
             self.connectPorts(self.world.world_out, soldier.world_in)
@@ -363,14 +373,21 @@ class _RolloutBattleModel(CoupledDEVS):
                 if port is not None:
                     self.connectPorts(port, soldier.command_in)
             else:
+                policy = UrbanRedPolicy(
+                    target_type="soldier",
+                    obstacles=snapshot.obstacles,
+                    target_priority=red_target_priority,
+                )
+                saved = (red_policy_states or {}).get(unit_id)
+                if saved:
+                    policy.last_seen = saved.get("last_seen")
+                    policy.search_index = saved.get("search_index")
+                self.red_policies = getattr(self, "red_policies", {})
+                self.red_policies[unit_id] = policy
                 brain = self.addSubModel(
                     RulePolicyAtomic(
                         name=f"Red_Rule_{unit_id}",
-                        policy=UrbanRedPolicy(
-                            target_type="soldier",
-                            obstacles=snapshot.obstacles,
-                            target_priority=red_target_priority,
-                        ),
+                        policy=policy,
                         decision_delay=1.0,
                     )
                 )
@@ -445,6 +462,8 @@ def rollout_plans_with_devs(
     seed: int,
     device: torch.device,
     red_target_priority: str = "nearest",
+    blue_max_step: float = 1.5,
+    red_policy_states: dict | None = None,
 ) -> torch.Tensor:
     """CEM 후보 전체를 실제 DEVS로 rollout해 미래 feature를 반환한다.
 
@@ -469,6 +488,8 @@ def rollout_plans_with_devs(
                 plan=plan,
                 horizon=horizon,
                 red_target_priority=red_target_priority,
+                blue_max_step=blue_max_step,
+                red_policy_states=red_policy_states,
             )
             simulator = Simulator(battle)
             # commander는 t=0(초기 상태)부터 1초 간격으로 기록하는데
@@ -484,6 +505,14 @@ def rollout_plans_with_devs(
             features.append(
                 _frames_to_features(snapshot=snapshot, frames=battle.commander.frames, horizon=horizon)
             )
+            if red_policy_states is not None:
+                # 구간 종료 시점의 RED 두뇌 상태를 호출자 dict에 되써서 다음 구간이
+                # 이어받게 한다 (단일 후보 전개 전용 — 후보 다발 채점에는 넘기지 말 것).
+                for uid, policy in getattr(battle, "red_policies", {}).items():
+                    red_policy_states[uid] = {
+                        "last_seen": policy.last_seen,
+                        "search_index": policy.search_index,
+                    }
     finally:
         random.setstate(episode_rng_state)
     stacked = np.stack(features, axis=0).astype(np.float32)

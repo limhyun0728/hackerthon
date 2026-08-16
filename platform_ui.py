@@ -65,6 +65,7 @@ PAGE_HTML = r"""<!doctype html>
   </select></label>
   <button class="primary" id="start">작전 개시</button>
   <button id="reset">배치 초기화</button>
+  <button id="truth" title="예측(주황)과 DEVS 실측 적 위치(◎)를 동시에 표시 — 검증용">실측 검증</button>
   <span style="flex:1"></span>
   <span class="status" id="status">지도를 눌러 부대를 배치하세요</span>
 </header>
@@ -102,6 +103,10 @@ PAGE_HTML = r"""<!doctype html>
     </div>
     <div class="panel">
       <h2>전개안 — 교전태세 × 부대대형</h2>
+      <div id="lens-tabs" style="display:none; gap:6px; margin-bottom:8px">
+        <button id="lens-safe">안전형 (생존 우선)</button>
+        <button id="lens-score" class="on">득점형 (임무 우선)</button>
+      </div>
       <div id="grid"><div class="status">작전 개시 후 표시됩니다</div></div>
       <div id="detail" class="status" style="margin-top:8px"></div>
       <button class="primary" id="commit" style="margin-top:8px; width:100%; display:none">선택한 안으로 6초 진행</button>
@@ -113,8 +118,10 @@ PAGE_HTML = r"""<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let S = { session:null, view:null, cells:[], sel:null, elabels:[], slabels:[],
+          lens:'score', lenses:['score'], showTrue:false,
           maps:{}, mapName:null, mode:'blue', place:{blue:[], red:[], obj:null},
           map:null, layers:[], unitLayers:[], pathLayers:[] };
+const LENS_KO = { safe:'안전형', score:'득점형' };
 
 const api = async (path, body) => {
   const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {};
@@ -247,13 +254,29 @@ function drawUnits() {
   S.unitLayers.push(marker(v.objective[0], v.objective[1], { px:20, z:200,
     html:'<div style="width:20px;height:20px;border-radius:50%;background:#a371f7;border:2px solid #fff;color:#fff;font:9px/16px sans-serif;text-align:center">OBJ</div>' }));
   for (const u of v.units) S.unitLayers.push(marker(u.x, u.y, { html: unitHtml(u, px), ax:0, ay:0 }));
+  // 검증 오버레이: DEVS 실측 적 위치(◎)와 belief(예측/관측) 사이 오차선.
+  if (S.showTrue && v.true_units) {
+    const belief = {}; for (const u of v.units) belief[u.id] = u;
+    for (const t of v.true_units) {
+      if (t.id < 200 || t.hp <= 0) continue;
+      S.unitLayers.push(marker(t.x, t.y, { px:22, z:300,
+        html:'<div style="width:22px;height:22px;border-radius:50%;border:2.5px dashed #ff2e2e;box-sizing:border-box;background:rgba(255,46,46,0.12)"></div>' }));
+      const b = belief[t.id];
+      if (b && b.hp > 0) {
+        S.pathLayers.push(new naver.maps.Polyline({ map:S.map,
+          path:[xyToLatLng(b.x, b.y), xyToLatLng(t.x, t.y)],
+          strokeColor:'#ff2e2e', strokeOpacity:0.6, strokeWeight:1.5, strokeStyle:'shortdot' }));
+      }
+    }
+  }
 }
 
 function renderGrid() {
   const el = $('grid');
   if (!S.cells.length) { el.innerHTML = '<div class="status">후보 계산 중…</div>'; return; }
   const map = {};
-  S.cells.forEach((c,i)=> map[`${c.engage_bin},${c.spread_bin}`] = i);
+  // 활성 관점(lens)의 셀만 격자에 올린다 — 안전형/득점형 아카이브 분리
+  S.cells.forEach((c,i)=> { if ((c.lens||'score')===S.lens) map[`${c.engage_bin},${c.spread_bin}`] = i; });
   let html = '<table class="grid"><tr><th></th>' + S.slabels.map(s=>`<th>${s}</th>`).join('') + '</tr>';
   for (let e=S.elabels.length-1; e>=0; e--) {
     html += `<tr><th>${S.elabels[e]}</th>`;
@@ -279,7 +302,7 @@ function renderTree() {
     .map(n=>`<div class="${n.current?'cur':''}" data-n="${n.id}">t=${n.time.toFixed(0)}s  ${n.label||'작전 개시'}</div>`).join('');
   $('tree').querySelectorAll('div[data-n]').forEach(d => d.onclick = async () => {
     S.view = await api('/api/goto', {session:S.session, node:d.dataset.n});
-    S.cells=[]; S.sel=null; renderTree(); drawUnits(); renderGrid(); loadCandidates();
+    S.cells=[]; S.sel=null; REC.byLens={}; renderTree(); drawUnits(); renderGrid(); loadCandidates();
   });
 }
 
@@ -326,14 +349,24 @@ $('rec-speed').onchange = () => { if (REC.timer) { stopPlay(); $('rec-play').cli
 
 async function loadRecommendation() {
   $('rec-panel').style.display='';
-  $('rec-info').textContent = '추천 시나리오 계산 중… (결심마다 최고안을 이어붙입니다)';
-  const j = await api('/api/recommend', {session:S.session});
+  const lensName = S.lenses.length > 1 ? `${LENS_KO[S.lens]} ` : '';
+  $('rec-info').textContent = `${lensName}추천 시나리오 계산 중… (결심마다 그 관점의 최고안을 이어붙입니다)`;
+  if (REC.byLens && REC.byLens[S.lens]) {          // 관점별 캐시 — 탭 전환 시 재계산 방지
+    applyRecommendation(REC.byLens[S.lens]); return;
+  }
+  const j = await api('/api/recommend', {session:S.session, lens:S.lens});
+  (REC.byLens ||= {})[S.lens] = j;
+  applyRecommendation(j);
+}
+
+function applyRecommendation(j) {
+  const lensName = S.lenses.length > 1 ? `[${LENS_KO[j.lens||'score']}] ` : '';
   REC.frames = j.frames||[]; REC.idx = 0;
   $('rec-slider').max = Math.max(0, REC.frames.length-1);
   const last = REC.frames[REC.frames.length-1];
   const b = last ? last.units.filter(u=>u.id<200 && u.hp>0).length : 0;
   const r = last ? last.units.filter(u=>u.id>=200 && u.hp>0).length : 0;
-  $('rec-info').textContent = `${REC.frames.length}프레임 · 결심 ${j.picks.length}회 · 종료 시 아군 ${b}명 / 적 ${r}명`;
+  $('rec-info').textContent = `${lensName}${REC.frames.length}프레임 · 결심 ${j.picks.length}회 · 종료 시 아군 ${b}명 / 적 ${r}명`;
   $('rec-picks').innerHTML = (j.picks||[]).map(p=>`t=${p.time.toFixed(0)}s ${p.label} → ${p.blue_alive}v${p.red_alive}`
     + (p.blue_hp!==undefined ? ` (HP <b style="color:#58a6ff">${Math.round(p.blue_hp)}</b>/<b style="color:#f85149">${Math.round(p.red_hp)}</b>)` : '')).join('<br>');
   showFrame(0);
@@ -343,7 +376,11 @@ async function loadCandidates() {
   $('status').textContent = '후보 계산 중…';
   const j = await api(`/api/candidates/${S.session}`);
   S.cells = j.cells||[]; S.sel=null; S.elabels=j.engage_labels||[]; S.slabels=j.spread_labels||[];
-  $('status').textContent = j.finished ? '전투 종료' : `t=${S.view.time.toFixed(0)}s · 전개안 ${S.cells.length}개`;
+  S.lenses = j.lenses||['score'];
+  if (!S.lenses.includes(S.lens)) S.lens = S.lenses[S.lenses.length-1];
+  $('lens-tabs').style.display = S.lenses.length > 1 ? 'flex' : 'none';
+  const shown = S.cells.filter(c=> (c.lens||'score')===S.lens).length;
+  $('status').textContent = j.finished ? '전투 종료' : `t=${S.view.time.toFixed(0)}s · ${LENS_KO[S.lens]||''} 전개안 ${shown}개`;
   $('commit').style.display = S.cells.length ? '' : 'none';
   $('commit').disabled = true; $('detail').textContent='';
   renderGrid();
@@ -410,20 +447,42 @@ $('start').onclick = async () => {
   S.session = j.session; S.view = j; $('hint').style.display='none';
   setPhase(true);
   renderTree();
+  REC.byLens = {};
+  await loadCandidates();      // 아카이브 먼저 — 추천이 이 아카이브를 재사용한다
   await loadRecommendation();
-  await loadCandidates();
 };
 
 $('commit').onclick = async () => {
   if (S.sel==null) return;
   const c = S.cells[S.sel];
-  S.view = await api('/api/select', {session:S.session, engage_bin:c.engage_bin, spread_bin:c.spread_bin});
-  S.cells=[]; S.sel=null; stopPlay(); renderTree();
-  await loadRecommendation(); await loadCandidates();
+  S.view = await api('/api/select', {session:S.session, engage_bin:c.engage_bin,
+                                     spread_bin:c.spread_bin, lens:c.lens||'score'});
+  S.cells=[]; S.sel=null; stopPlay(); REC.byLens = {}; renderTree();
+  await loadCandidates(); await loadRecommendation();
 };
+
+for (const lensId of ['safe','score']) {
+  $(`lens-${lensId}`).onclick = async () => {
+    if (S.lens === lensId) return;
+    S.lens = lensId;
+    $('lens-safe').classList.toggle('on', lensId==='safe');
+    $('lens-score').classList.toggle('on', lensId==='score');
+    S.sel = null; $('commit').disabled = true; $('detail').textContent='';
+    const shown = S.cells.filter(c=> (c.lens||'score')===S.lens).length;
+    if (S.view) $('status').textContent = `t=${S.view.time.toFixed(0)}s · ${LENS_KO[S.lens]} 전개안 ${shown}개`;
+    renderGrid(); drawUnits();
+    if (S.session && $('rec-panel').style.display !== 'none') await loadRecommendation();
+  };
+}
 
 $('map-select').onchange = () => { S.mapName = $('map-select').value;
   S.place={blue:[],red:[],obj:null}; S.session=null; S.view=null; initMap(); };
+
+$('truth').onclick = () => {
+  S.showTrue = !S.showTrue;
+  $('truth').classList.toggle('on', S.showTrue);
+  drawUnits();
+};
 
 setPhase(false);
 

@@ -56,6 +56,7 @@ from hackerthon.worldmodel.actions import ActionType
 from hackerthon.worldmodel.cem_planner import (
     CEMConfig,
     CEMDistribution,
+    FutureActionPlanBatch,
     ObservedActionWindow,
     build_initial_distribution,
     rollout_with_world_model,
@@ -109,6 +110,8 @@ ENGAGE_EDGES = (0.0, 0.001, 0.15, 0.35, 0.60)
 SPREAD_EDGES = (0.0, 0.70, 0.90, 1.10, 1.50)
 ENGAGE_LABELS = ("순수기동", "산발사격", "교전", "적극교전", "전력사격")
 SPREAD_LABELS = ("급속집결", "집결", "대형유지", "산개", "급속분산")
+# wm2 관점 채점 라벨 — safe: 생존 비용 포함(β=1), score: 임무 진행 전념(β=0)
+LENS_LABELS = {"safe": "안전형", "score": "득점형"}
 # 대형 변화를 못 재는 경우(생존 2명 미만, 시작 대형이 사실상 0)는 "대형유지"로 접는다.
 SPREAD_NEUTRAL_BIN = 2
 # 시작 평균 쌍거리가 이보다 작으면 비율이 폭주하므로 변화를 정의하지 않는다.
@@ -165,6 +168,9 @@ class Session:
     history: list[Any] = field(default_factory=list)
     # RED belief. 관측되면 실제로, 아니면 예측으로 유지된다.
     red_belief: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # RED rule 두뇌 상태(last_seen·순찰 인덱스) — 6틱 전개 구간을 넘어 승계해
+    # 풀심(연속)의 RED와 같은 추격 지속성을 만든다.
+    red_rollout_states: dict[int, dict[str, Any]] = field(default_factory=dict)
     # 후보 캐시. 지휘관이 셀을 고르면 그 plan의 결과 state를 그대로 쓴다.
     pending: dict[str, Any] = field(default_factory=dict)
 
@@ -382,6 +388,8 @@ def _observed_red_ids(rows: list[dict[str, Any]], obstacles) -> set[int]:
     판정을 사격 규칙(거리 + LOS)과 일치시킨다. 시뮬레이터는 시야각과 무관하게
     LOS만 트이면 피해를 주므로, 관측에만 FOV를 요구하면 "주황(미관측)인데
     사격선이 그려지는" 모순이 생긴다. 쏠 수 있으면 파악한 것으로 본다.
+    지휘관 지도는 전지적 시점이 아니라 병사 관측 기반이다 — 이 반경을 사격보다
+    넓히지 말 것 (2026-08-15 확인: 넓힘 시도는 설계 의도 위반으로 롤백됨).
     """
     rects = [tuple(float(v) for v in rect) for rect in obstacles]
     blue = [r for r in rows if r["id"] < 200 and r["hp"] > 0.0]
@@ -669,8 +677,15 @@ def build_archive(
     model_config=None,
     value_head=None,
     iterations: int = 1,
+    lens_heads=None,
+    wm2_rollout=None,
 ) -> dict[str, Any]:
-    """후보를 뽑아 태세 축 아카이브에 배치하고 셀별 elite를 만든다."""
+    """후보를 뽑아 태세 축 아카이브에 배치하고 셀별 elite를 만든다.
+
+    lens_heads(wm2 안전형/득점형 value head)가 있으면 후보마다 두 관점으로 채점해
+    셀×관점별 elite를 보존한다 — 아카이브 키가 (교전, 대형, 관점) 3축이 된다.
+    분포 refit은 득점형 점수 기준(진행 지향 탐색), 안전형은 같은 풀에서 자기 elite를 뽑는다.
+    """
     node = session.current
     batch = _slot_batch(session, node)
     alive_blue = sum(1 for r in node.unit_rows if r["id"] < 200 and r["hp"] > 0.0)
@@ -713,10 +728,27 @@ def build_archive(
         def score_fn(future_features):
             return score_future_features_torch(current_batch=batch, future_features=future_features)
 
+    wm2_fn = None
+    if wm2_rollout is not None:
+        history_rows = getattr(node, "belief_tail", None)
+        if not history_rows:
+            history_rows = _warmup_history_rows(batch, snapshot, node.time_sec)
+        wm2_fn = wm2_rollout.make_fn(
+            current_rows=node.unit_rows, obstacles=session.obstacles,
+            mission_type=session.mission_type, objective=session.objective,
+            duration_sec=session.duration_sec, time_sec=node.time_sec, batch=batch,
+            history_rows=history_rows,
+        )
+
     def rollout(plans):
-        """후보를 굴려 미래 feature를 낸다. model이 있으면 예측, 없으면 DEVS."""
+        """후보를 굴려 미래 feature를 낸다. wm2/구 model이 있으면 예측, 없으면 DEVS."""
+        if wm2_fn is not None:
+            return wm2_fn(plans)
         if model is None:
-            return rollout_plans_with_devs(plans=plans, snapshot=snapshot, seed=seed, device=device)
+            return rollout_plans_with_devs(
+                plans=plans, snapshot=snapshot, seed=seed, device=device,
+                blue_max_step=1.0,   # 본게임 물리 (전원 1.0)
+            )
         # history가 모자라면 현재 state를 복제해 채운다. 초반 결심에서도 예측이 되게.
         need = int(model_config.history_frames)
         hist = (session.history + [batch])[-need:]
@@ -756,7 +788,17 @@ def build_archive(
     }
     hp_now = {int(r["id"]): float(r["hp"]) for r in node.unit_rows}
 
-    archive: dict[tuple[int, int], dict[str, Any]] = {}
+    lens_scorer = None
+    if lens_heads:
+        from wm2_value_bridge import LensScorer
+
+        lens_scorer = LensScorer(
+            lens_heads, device=device, obstacles=session.obstacles,
+            mission_type=session.mission_type, objective=session.objective,
+            duration_sec=session.duration_sec, current_rows=node.unit_rows,
+        )
+
+    archive: dict[tuple[int, int, str], dict[str, Any]] = {}
     # CEM 반복을 돌리되 **모든 iteration의 후보를 전부 아카이빙**한다. 반복은 분포를
     # 좁혀 품질을 올리고, 아카이브는 그 과정에서 나온 후보를 태세 축에 흩뿌려 다양성을
     # 지킨다. 초반 iteration의 넓은 후보와 후반의 좋은 후보가 함께 남는다.
@@ -766,7 +808,12 @@ def build_archive(
             generator=generator, device=device,
         )
         features = rollout(plans)
-        scores = score_fn(features).detach().cpu().numpy()
+        if lens_scorer is not None:
+            # wm2 관점 채점을 쓰면 legacy score_fn은 건너뛴다. refit용 점수는
+            # 아래 후보 루프에서 득점형 관점으로 채워진다.
+            scores = np.zeros(int(plans.action_features.shape[0]), dtype=np.float64)
+        else:
+            scores = score_fn(features).detach().cpu().numpy()
         features_np = features.detach().cpu().numpy()
         types = plans.action_type_ids.detach().cpu().numpy()
         issued = plans.issued_mask.detach().cpu().numpy()
@@ -786,27 +833,41 @@ def build_archive(
             spread = _formation_change(node.unit_rows, rows)
             e_bin = _bin_index(engage, ENGAGE_EDGES)
             s_bin = SPREAD_NEUTRAL_BIN if np.isnan(spread) else _bin_index(spread, SPREAD_EDGES)
-            key = (e_bin, s_bin)
-            if key in archive and scores[cand] <= archive[key]["score"]:
-                continue
-            path = _build_path(
-                batch, features_np[cand], plans, cand,
-                node.time_sec, session.obstacles, belief_start=node.unit_rows,
-            )
-            archive[key] = {
-                "score": float(scores[cand]),
-                # iteration마다 plans가 달라지므로 전역 index로는 못 찾는다.
-                # 선택 시 DEVS로 굴릴 수 있게 그 후보의 plan을 여기 들고 있는다.
-                "plan": plans.take_candidates(
-                    torch.tensor([cand], dtype=torch.long, device=plans.action_features.device)
-                ),
-                "engage": engage,
-                "spread": 1.0 if np.isnan(spread) else float(spread),
-                # 마지막 프레임을 그대로 쓴다. 같은 좌표를 다시 만들면 관측 이력이
-                # 떨어져 나가, 추천 시나리오를 이어붙일 때 last_seen이 끊긴다.
-                "rows": path[-1]["units"],
-                "path": path,
-            }
+            if lens_scorer is not None:
+                rows_prev = _rows_from_features(
+                    batch, features_np[cand, -2], node.time_sec + session.horizon - 1
+                )
+                cand_scores = lens_scorer.score(
+                    rows, rows_prev, node.time_sec + session.horizon
+                )
+                scores[cand] = cand_scores["score"]   # 분포 refit은 득점형 기준
+            else:
+                cand_scores = {"score": float(scores[cand])}
+            path = None
+            for lens, lens_score in cand_scores.items():
+                key = (e_bin, s_bin, lens)
+                if key in archive and lens_score <= archive[key]["score"]:
+                    continue
+                if path is None:
+                    path = _build_path(
+                        batch, features_np[cand], plans, cand,
+                        node.time_sec, session.obstacles, belief_start=node.unit_rows,
+                    )
+                archive[key] = {
+                    "score": float(lens_score),
+                    "lens": lens,
+                    # iteration마다 plans가 달라지므로 전역 index로는 못 찾는다.
+                    # 선택 시 DEVS로 굴릴 수 있게 그 후보의 plan을 여기 들고 있는다.
+                    "plan": plans.take_candidates(
+                        torch.tensor([cand], dtype=torch.long, device=plans.action_features.device)
+                    ),
+                    "engage": engage,
+                    "spread": 1.0 if np.isnan(spread) else float(spread),
+                    # 마지막 프레임을 그대로 쓴다. 같은 좌표를 다시 만들면 관측 이력이
+                    # 떨어져 나가, 추천 시나리오를 이어붙일 때 last_seen이 끊긴다.
+                    "rows": path[-1]["units"],
+                    "path": path,
+                }
 
         if iteration + 1 < cem_config.num_iterations:
             elite = torch.topk(
@@ -817,14 +878,78 @@ def build_archive(
             )
 
     session.pending = {"archive": archive}
+    cells = _cells_from_archive(archive)
+    return {
+        "cells": cells,
+        "finished": False,
+        "alive_blue": alive_blue,
+        "alive_red": alive_red,
+        "engage_labels": list(ENGAGE_LABELS),
+        "spread_labels": list(SPREAD_LABELS),
+        "lenses": ["safe", "score"] if lens_heads else ["score"],
+    }
+
+
+def _warmup_history_rows(batch, snapshot, time_sec: float) -> list[list[dict[str, Any]]]:
+    """t=0(관측 이력 없음)용 합성 이력 — BLUE 정지 2틱을 DEVS로 굴려 RED 순찰 개시
+    속도를 만든다.
+
+    월드모델의 RED 예측은 이력 속도에 의존하는데, 배치 직후에는 이력이 없어 RED가
+    제자리로 상상된다. 배치 시점엔 지휘관이 적을 직접 놓아 전원 관측 상태이므로
+    실측 워밍업이 belief 규약을 어기지 않는다.
+    """
+    import torch as _t
+
+    unit_ids = [int(e) for i, e in enumerate(batch.entity_ids)
+                if int(batch.type_ids[i]) == int(ObjectType.UNIT)]
+    blue_ids = sorted(u for u in unit_ids if u < 200)
+    red_ids = sorted(u for u in unit_ids if u >= 200)
+    shape3 = (1, 2, len(blue_ids))
+    plans = FutureActionPlanBatch(
+        action_features=_t.zeros(*shape3, ACTION_DIM),
+        action_unit_ids=_t.as_tensor(blue_ids).reshape(1, 1, -1).expand(*shape3).clone(),
+        issued_mask=_t.zeros(*shape3, dtype=_t.bool),
+        action_type_ids=_t.zeros(*shape3, dtype=_t.long),
+        target_entity_ids=_t.zeros(*shape3, dtype=_t.long),
+        target_indices=_t.zeros(*shape3, dtype=_t.long),
+        move_xy_norm=_t.zeros(*shape3, 2),
+        theta_radians=_t.zeros(*shape3),
+        red_target_ids=_t.as_tensor(red_ids, dtype=_t.long),
+    )
+    features = rollout_plans_with_devs(
+        plans=plans, snapshot=snapshot, seed=0, device=torch.device("cpu"),
+        blue_max_step=1.0,   # 본게임 물리 (전원 1.0)
+    )
+    array = np.asarray(features.detach().cpu()) if hasattr(features, "detach") else np.asarray(features)
+    warm = [_rows_from_features(batch, array[0, k], time_sec) for k in range(array.shape[1])]
+    # 워밍업은 미래 방향 순찰이다. 그대로 이력에 넣으면 h2 속도(현재−warm)가 역방향이
+    # 되므로, 현재 기준 반사로 과거 프레임을 합성한다: past_k = current − (warm_k − current).
+    # 속도열이 (warm2−warm1, warm1−current)로 순방향 순찰 스텝이 되고, anchor(h0)와
+    # 예측 잔차의 기준 규약과도 자기일관이다. BLUE는 워밍업에서 정지라 그대로 남는다.
+    current = {int(r["id"]): r for r in snapshot.unit_rows}
+    def _reflect(frame_rows):
+        out = []
+        for r in frame_rows:
+            c = current[int(r["id"])]
+            out.append({**r,
+                        "x": 2.0 * float(c["x"]) - float(r["x"]),
+                        "y": 2.0 * float(c["y"]) - float(r["y"]),
+                        "hp": float(c["hp"]), "ammo": c.get("ammo", r.get("ammo", 0))})
+        return out
+    return [_reflect(warm[-1]), _reflect(warm[0])]   # [h0(2틱 전), h1(1틱 전)]
+
+
+def _cells_from_archive(archive: dict) -> list[dict[str, Any]]:
+    """아카이브 엔트리를 표시용 셀 목록으로 요약한다 (build_archive·recommend 공용)."""
     cells = []
-    for (e_bin, s_bin), entry in sorted(archive.items()):
+    for (e_bin, s_bin, lens), entry in sorted(archive.items()):
         blue_hp = sum(r["hp"] for r in entry["rows"] if r["id"] < 200)
         red_hp = sum(r["hp"] for r in entry["rows"] if r["id"] >= 200)
         cells.append(
             {
                 "engage_bin": e_bin,
                 "spread_bin": s_bin,
+                "lens": lens,
                 "label": f"{ENGAGE_LABELS[e_bin]} · {SPREAD_LABELS[s_bin]}",
                 "score": entry["score"],
                 "engage": entry["engage"],
@@ -837,14 +962,7 @@ def build_archive(
                 "rows": entry["rows"],
             }
         )
-    return {
-        "cells": cells,
-        "finished": False,
-        "alive_blue": alive_blue,
-        "alive_red": alive_red,
-        "engage_labels": list(ENGAGE_LABELS),
-        "spread_labels": list(SPREAD_LABELS),
-    }
+    return cells
 
 
 class PlatformState:
@@ -863,6 +981,9 @@ class PlatformState:
         recommend_candidates: int = 24,
         value_head_checkpoint: Path | None = None,
         archive_iterations: int = 1,
+        wm2_safe_value: Path | None = None,
+        wm2_score_value: Path | None = None,
+        wm2_checkpoint: Path | None = None,
     ):
         self.maps: dict[str, dict[str, Any]] = {}
         for path in sorted(maps_root.iterdir()):
@@ -903,6 +1024,25 @@ class PlatformState:
         if value_head_checkpoint is not None:
             self.value_head = load_value_head(value_head_checkpoint, device)
             print(f"value head 로드: {value_head_checkpoint.name} (아카이브 채점에 사용)")
+        # wm2 안전형/득점형 관점 채점 (있으면 legacy value head 대신 이쪽을 쓴다)
+        self.wm2_lens_heads = None
+        lens_paths: dict[str, Path] = {}
+        if wm2_safe_value is not None:
+            lens_paths["safe"] = wm2_safe_value
+        if wm2_score_value is not None:
+            lens_paths["score"] = wm2_score_value
+        if lens_paths:
+            from wm2_value_bridge import load_lens_heads
+
+            self.wm2_lens_heads = load_lens_heads(lens_paths, device)
+        # wm2 월드모델 상상 백엔드 (--archive-backend wm2)
+        self.wm2_rollout = None
+        if wm2_checkpoint is not None:
+            from wm2_value_bridge import Wm2Rollout
+
+            self.wm2_rollout = Wm2Rollout(wm2_checkpoint, device)
+        if archive_backend == "wm2" and self.wm2_rollout is None:
+            raise ValueError("--archive-backend wm2에는 --wm2-checkpoint가 필요하다")
 
     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         map_name = str(payload.get("map") or next(iter(self.maps)))
@@ -937,6 +1077,18 @@ class PlatformState:
                              "heading": 0.0, "hp": MAX_HP, "ammo": int(MAX_AMMO), "time": 0.0})
         else:
             rows = _initial_rows(config, blue_count=blue, red_count=red, rng=rng)
+
+        # 초기 heading을 상대 진영 중심으로 돌린다. 전원 0°(동쪽) 고정이면 서쪽의
+        # 적은 120° 시야콘 밖이라, 바로 앞의 BLUE도 못 본 RED가 태연히 순찰을
+        # 떠나는 왜곡이 생긴다 (2026-08-15 실측: "코앞인데 교전 안 함"의 원인 1).
+        blues = [r for r in rows if r["id"] < 200]
+        reds = [r for r in rows if r["id"] >= 200]
+        for r in rows:
+            foes = reds if r["id"] < 200 else blues
+            if foes:
+                cx = sum(f["x"] for f in foes) / len(foes)
+                cy = sum(f["y"] for f in foes) / len(foes)
+                r["heading"] = math.degrees(math.atan2(cy - r["y"], cx - r["x"]))
 
         points = _spawn_points(config)
         center_x = (WORLD_X_MIN + WORLD_X_MAX) / 2.0
@@ -1041,9 +1193,13 @@ class PlatformState:
             model_config=self.model_config,
             value_head=self.value_head,
             iterations=self.archive_iterations,
+            lens_heads=self.wm2_lens_heads,
+            wm2_rollout=self.wm2_rollout if self.archive_backend == "wm2" else None,
         )
 
-    def recommend(self, session_id: str, *, candidates: int | None = None) -> dict[str, Any]:
+    def recommend(
+        self, session_id: str, *, candidates: int | None = None, lens: str = "score"
+    ) -> dict[str, Any]:
         """현재 지점에서 매 결심마다 최고 점수 후보를 이어붙여 끝까지 전개한다.
 
         지휘관에게 먼저 보여줄 기준안이다. 후보를 전부 끝까지 굴리는 게 아니라
@@ -1059,6 +1215,10 @@ class PlatformState:
         true_state = [dict(r) for r in (node.true_rows or node.unit_rows)]
         # 이 함수는 가정 전개라 세션의 belief를 건드리면 안 된다. 끝나면 되돌린다.
         saved_belief = {k: dict(v) for k, v in session.red_belief.items()}
+        # 추천 전개가 세션의 후보 아카이브(pending)를 밟으면, 화면에 이미 떠 있는
+        # 전개안 선택이 "후보가 없다"로 죽는다 (관점 탭 전환 → 추천 재계산 순서에서
+        # 실제로 밟힘). 끝나면 원래 pending을 복원한다.
+        saved_pending = session.pending
         time_sec = node.time_sec
         # **고를 때는 예측, 보여줄 때는 실측**이다.
         #
@@ -1070,8 +1230,16 @@ class PlatformState:
         # 반응을 지휘관에게 보여주게 된다.
         #
         # 비용은 구간당 DEVS rollout 1회다. 후보 전부를 DEVS로 굴리는 것보다 훨씬 싸다.
+        #
+        # 추천은 별도의 소형 탐색이 아니다 — 본 아카이브와 같은 CEM 탐색 예산으로
+        # 아카이빙된 셀들 중 관점(lens) 최고 value를 결심마다 이어붙인다. 첫 구간은
+        # 지휘관 화면에 이미 떠 있는 그 아카이브를 그대로 재사용한다.
         use_model = self.model if self.recommend_backend == "model" else None
-        num = candidates or self.recommend_candidates
+        num = candidates or self.candidates
+        reuse_entries = dict(saved_pending.get("archive") or {})
+        prev_tail = None   # 다음 결심 윈도우의 관측 이력 (belief 프레임 꼬리)
+        # 가정 전개용 RED 두뇌 상태 — 세션 상태를 복사해 쓰고 되돌리지 않는다
+        chain_red = {k: dict(v) for k, v in session.red_rollout_states.items()}
 
         frames: list[dict[str, Any]] = [
             {"time": time_sec, "units": [dict(r) for r in rows], "fire": []}
@@ -1083,34 +1251,49 @@ class PlatformState:
             if alive_blue == 0 or alive_red == 0:
                 break
             probe = TreeNode(node_id="probe", parent_id=None, time_sec=time_sec, unit_rows=rows)
-            saved_id, saved_nodes = session.current_id, session.nodes
-            session.nodes = {**saved_nodes, "probe": probe}
-            session.current_id = "probe"
-            try:
-                archive = build_archive(
-                    session, candidates=num, seed=int(time_sec) * 7919 + len(picks),
-                    device=self.device, model=use_model, model_config=self.model_config,
-                    value_head=self.value_head, iterations=self.archive_iterations,
-                )
-                # cells에는 plan이 없다(표시용 요약만 담는다). DEVS로 다시 굴리려면
-                # plan이 필요하므로 pending이 지워지기 전에 집어 둔다.
-                entries = dict(session.pending.get("archive") or {})
-            finally:
-                session.nodes, session.current_id = saved_nodes, saved_id
-                session.pending = {}
-            cells = archive.get("cells") or []
+            if prev_tail:
+                probe.belief_tail = prev_tail
+            if reuse_entries:
+                # 첫 구간: 지휘관이 보고 있는 그 아카이브에서 고른다 (재탐색 없음)
+                entries, reuse_entries = reuse_entries, {}
+                cells = _cells_from_archive(entries)
+            else:
+                saved_id, saved_nodes = session.current_id, session.nodes
+                session.nodes = {**saved_nodes, "probe": probe}
+                session.current_id = "probe"
+                try:
+                    archive = build_archive(
+                        session, candidates=num, seed=int(time_sec) * 7919 + len(picks),
+                        device=self.device, model=use_model, model_config=self.model_config,
+                        value_head=self.value_head, iterations=self.archive_iterations,
+                        lens_heads=self.wm2_lens_heads,
+                        wm2_rollout=self.wm2_rollout if self.archive_backend == "wm2" else None,
+                    )
+                    # cells에는 plan이 없다(표시용 요약만 담는다). DEVS로 다시 굴리려면
+                    # plan이 필요하므로 pending이 지워지기 전에 집어 둔다.
+                    entries = dict(session.pending.get("archive") or {})
+                finally:
+                    session.nodes, session.current_id = saved_nodes, saved_id
+                    session.pending = saved_pending
+                cells = archive.get("cells") or []
             if not cells:
                 break
-            best = max(cells, key=lambda c: c["score"])
+            # 관점(lens)별 추천: 안전형/득점형이 각자의 채점으로 전개를 고른다.
+            lens_cells = [c for c in cells if c.get("lens", "score") == lens] or cells
+            best = max(lens_cells, key=lambda c: c["score"])
 
             # 고른 plan 하나를 DEVS로 굴려 실제 전개를 얻는다. probe의 true_rows를
             # 직전 구간의 DEVS 결과로 두므로 구간마다 실측으로 접지된다.
-            entry = entries.get((best["engage_bin"], best["spread_bin"]))
+            entry = entries.get(
+                (best["engage_bin"], best["spread_bin"], best.get("lens", "score"))
+            )
             probe.true_rows = true_state
             if entry is None:
                 true_rows, true_path = [dict(r) for r in best["rows"]], best["path"]
             else:
-                true_rows, true_path = self._advance_true(session, probe, entry)
+                true_rows, true_path = self._advance_true(
+                    session, probe, entry, red_states=chain_red
+                )
 
             # 관측된 것은 실측, 미관측 RED는 같은 plan의 월드모델 예측으로 합친다.
             belief_path = _merge_belief_path(
@@ -1141,14 +1324,23 @@ class PlatformState:
             true_state = [dict(r) for r in true_rows]
             # 다음 결심의 계획 입력. 화면과 같은 belief여야 지휘관이 본 것과 계획이 맞는다.
             rows = [dict(r) for r in belief_path[-1]["units"]] if belief_path else true_state
+            # 다음 윈도우의 관측 이력 — belief 프레임 꼬리 (미관측 RED는 예측 위치가 anchor)
+            prev_tail = [
+                [dict(u) for u in frame["units"]] for frame in belief_path[-2:]
+            ] if belief_path else None
             time_sec += session.horizon
         session.red_belief = saved_belief
-        return {"frames": frames, "picks": picks, "objective": list(session.objective)}
+        return {
+            "frames": frames, "picks": picks,
+            "objective": list(session.objective), "lens": lens,
+        }
 
-    def select(self, session_id: str, engage_bin: int, spread_bin: int) -> dict[str, Any]:
+    def select(
+        self, session_id: str, engage_bin: int, spread_bin: int, lens: str = "score"
+    ) -> dict[str, Any]:
         session = self.sessions[session_id]
         archive = session.pending.get("archive") or {}
-        entry = archive.get((engage_bin, spread_bin))
+        entry = archive.get((engage_bin, spread_bin, lens))
         if entry is None:
             raise ValueError("선택한 셀에 후보가 없다")
         parent = session.current
@@ -1164,7 +1356,10 @@ class PlatformState:
             time_sec=time_sec,
             unit_rows=belief_rows,
             true_rows=true_rows,
-            chosen_label=f"{ENGAGE_LABELS[engage_bin]} · {SPREAD_LABELS[spread_bin]}",
+            chosen_label=(
+                (f"{LENS_LABELS[lens]} · " if self.wm2_lens_heads else "")
+                + f"{ENGAGE_LABELS[engage_bin]} · {SPREAD_LABELS[spread_bin]}"
+            ),
             red_belief={k: dict(v) for k, v in session.red_belief.items()},
             true_path=true_path,
         )
@@ -1172,10 +1367,20 @@ class PlatformState:
         session.nodes[node_id] = node
         session.current_id = node_id
         session.pending = {}
+        # 다음 결심 윈도우의 관측 이력 — 관측은 실측, 미관측 RED는 예측으로 병합한
+        # belief 궤적의 꼬리 (recommend의 표시 규약과 동일)
+        merged = _merge_belief_path(
+            true_path, entry.get("path") or [], session.obstacles,
+            parent.unit_rows, parent.time_sec,
+        )
+        node.belief_tail = [
+            [dict(u) for u in frame["units"]] for frame in merged[-2:]
+        ]
         return self.session_view(session_id)
 
     def _advance_true(
-        self, session: Session, parent: TreeNode, entry: dict[str, Any]
+        self, session: Session, parent: TreeNode, entry: dict[str, Any],
+        red_states: dict | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """선택된 plan 하나만 실제 DEVS로 굴려 진짜 다음 상태와 그 경로를 만든다.
 
@@ -1200,6 +1405,10 @@ class PlatformState:
             snapshot=snapshot,
             seed=int(parent.time_sec) * 7919,
             device=self.device,
+            blue_max_step=1.0,   # 본게임 물리 (전원 1.0) — BLUE 1.5 과속이 RED 무력화 원인
+            red_policy_states=(
+                session.red_rollout_states if red_states is None else red_states
+            ),
         )
         frames = features.detach().cpu().numpy()[0]
         true_path = _build_path(
@@ -1250,10 +1459,12 @@ class SelectRequest(BaseModel):
     session: str
     engage_bin: int = Field(ge=0)
     spread_bin: int = Field(ge=0)
+    lens: str = "score"
 
 
 class SessionOnly(BaseModel):
     session: str
+    lens: str = "score"
 
 
 class GotoRequest(BaseModel):
@@ -1312,11 +1523,16 @@ def create_app(state: PlatformState) -> FastAPI:
 
     @app.post("/api/recommend")
     async def recommend(request: SessionOnly) -> dict[str, Any]:
-        return await run_in_threadpool(_guard, state.recommend, request.session)
+        return await run_in_threadpool(
+            _guard, lambda: state.recommend(request.session, lens=request.lens)
+        )
 
     @app.post("/api/select")
     async def select(request: SelectRequest) -> dict[str, Any]:
-        return _guard(state.select, request.session, request.engage_bin, request.spread_bin)
+        return _guard(
+            state.select, request.session, request.engage_bin, request.spread_bin,
+            request.lens,
+        )
 
     @app.post("/api/goto")
     async def goto(request: GotoRequest) -> dict[str, Any]:
@@ -1335,9 +1551,9 @@ def main(argv=None) -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--archive-backend",
-        choices=("devs", "model"),
+        choices=("devs", "model", "wm2"),
         default="devs",
-        help="아카이브 후보 rollout 방식. model은 빠르지만 예측 궤적이 건물을 관통한다",
+        help="아카이브 후보 rollout 방식. model=구 JEPA, wm2=run13 상상(빠름, --wm2-checkpoint 필요)",
     )
     parser.add_argument(
         "--recommend-backend",
@@ -1369,6 +1585,18 @@ def main(argv=None) -> int:
         default=1,
         help="CEM 반복 횟수. 매 반복의 후보를 전부 아카이빙하므로 늘리면 셀이 더 찬다",
     )
+    parser.add_argument(
+        "--wm2-safe-value", type=Path, default=None,
+        help="wm2 안전형(β=1) value head — 실측 입력판(wm2_value_rtgs_real.pt)을 줄 것",
+    )
+    parser.add_argument(
+        "--wm2-score-value", type=Path, default=None,
+        help="wm2 득점형(β=0) value head — 실측 입력판(wm2_value_rtg_real.pt)을 줄 것",
+    )
+    parser.add_argument(
+        "--wm2-checkpoint", type=Path, default=None,
+        help="wm2 월드모델(run13) — --archive-backend wm2의 상상 롤아웃에 사용",
+    )
     args = parser.parse_args(argv)
 
     state = PlatformState(
@@ -1382,6 +1610,9 @@ def main(argv=None) -> int:
         recommend_candidates=args.recommend_candidates,
         value_head_checkpoint=args.value_head_checkpoint,
         archive_iterations=args.archive_iterations,
+        wm2_safe_value=args.wm2_safe_value,
+        wm2_score_value=args.wm2_score_value,
+        wm2_checkpoint=args.wm2_checkpoint,
     )
     print(f"지휘관 플랫폼: http://{args.host}:{args.port}/  (API 문서 /docs)")
     uvicorn.run(create_app(state), host=args.host, port=args.port, log_level="warning")
