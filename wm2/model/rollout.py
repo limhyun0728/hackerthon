@@ -9,7 +9,23 @@ from __future__ import annotations
 
 import torch
 
-from .features import MAX_HP, MAX_MOVE_PER_STEP
+from .features import (
+    MAX_HP, MAX_MOVE_PER_STEP,
+    WORLD_X_MAX, WORLD_X_MIN, WORLD_Y_MAX, WORLD_Y_MIN,
+)
+
+
+def current_xy_hp(unit_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """window 피처 (..., 9프레임, U, F)에서 h2(현재) 프레임의 월드 좌표·HP.
+
+    clamp_physics 사슬의 시작점은 반드시 현재 위치여야 한다 — 잔차 앵커(h0, 2틱 전)를
+    시작점으로 쓰면 f1이 "3틱 거리"를 1틱 예산으로 잘려 상상 이동이 체계적으로 압축된다
+    (2026-08-16 진단: 표시 f1 오차 4.3m→1.5m, 전진 계획 상상 progress 과소평가).
+    """
+    cur = unit_features[..., 2, :, :]
+    x = (cur[..., 3] + 1.0) * 0.5 * (WORLD_X_MAX - WORLD_X_MIN) + WORLD_X_MIN
+    y = (cur[..., 4] + 1.0) * 0.5 * (WORLD_Y_MAX - WORLD_Y_MIN) + WORLD_Y_MIN
+    return torch.stack([x, y], dim=-1), cur[..., 1] * MAX_HP
 
 
 def assemble_positions(
@@ -30,14 +46,15 @@ def assemble_hp(
 
 
 def clamp_physics(
-    positions: torch.Tensor,   # (B, F, U, 2) 조립된 절대 위치
-    anchor_xy: torch.Tensor,   # (B, U, 2)
+    positions: torch.Tensor,   # (B, F, U, 2) 조립된 절대 위치 (f1..f6)
+    anchor_xy: torch.Tensor,   # (B, U, 2) **현재(h2) 위치** — 사슬 시작점. h0을 주면 f1이 잘린다
     hp: torch.Tensor,          # (B, F, U) 조립된 HP
-    anchor_alive: torch.Tensor,  # (B, U) bool
+    anchor_alive: torch.Tensor,  # (B, U) bool — 현재 생존 여부
 ) -> torch.Tensor:
     """프레임 간 이동 ≤ MAX_MOVE_PER_STEP, 사망 시 그 자리 동결.
 
-    방향은 살리고 크기만 줄인다. anchor에서 이미 죽어 있으면 anchor에 고정.
+    방향은 살리고 크기만 줄인다. 시작점에서 이미 죽어 있으면 그 자리에 고정.
+    첫 프레임 f1은 시작점에서 1틱 거리다 — 시작점은 current_xy_hp()의 현재 위치를 쓸 것.
     """
     frames = []
     previous = anchor_xy

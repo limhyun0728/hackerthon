@@ -56,7 +56,7 @@ from ..model.features import (
     norm_y,
 )
 from ..plan.cem import PlanCandidates, plan as cem_plan, _action_tokens
-from ..model.rollout import assemble_hp, assemble_positions, clamp_physics
+from ..model.rollout import assemble_hp, assemble_positions, clamp_physics, current_xy_hp
 from ..plan.score import progress_batch, value_input_from_assembled
 
 REPLAN_EVERY = 6
@@ -271,7 +271,8 @@ class PlannerBridge:
         anchor_hp = torch.from_numpy((anchor[:, 1] * MAX_HP).astype(np.float32)).unsqueeze(0).to(self.device)
         raw = assemble_positions(anchor_xy, pred["dpos"][:, 2:])
         hp = assemble_hp(anchor_hp, pred["ddmg"][:, 2:])
-        clamped = clamp_physics(raw, anchor_xy, hp, anchor_hp > 0)
+        cur_xy, cur_hp = current_xy_hp(unit_t)
+        clamped = clamp_physics(raw, cur_xy, hp, cur_hp > 0)
         ammo_final = (
             torch.from_numpy((anchor[:, 2] * MAX_AMMO).astype(np.float32)).unsqueeze(0).to(self.device)
             - pred["dammo"][:, -1].clamp_min(0) * MAX_AMMO

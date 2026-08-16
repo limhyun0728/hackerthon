@@ -120,7 +120,7 @@ def build_imagined_samples(
     from ..data.batch import collate
     from ..data.windows import build_windows
     from ..model.features import MAX_AMMO
-    from ..model.rollout import assemble_hp, assemble_positions, clamp_physics
+    from ..model.rollout import assemble_hp, assemble_positions, clamp_physics, current_xy_hp
     from ..plan.score import value_input_from_assembled
 
     layout = build_layout(episode)
@@ -149,7 +149,8 @@ def build_imagined_samples(
         pred = heads(out["unit_tokens"], out["mission_tokens"])
         raw = assemble_positions(batch["anchor_xy"], pred["dpos"][:, 2:])
         hp = assemble_hp(batch["anchor_hp"], pred["ddmg"][:, 2:])
-        clamped = clamp_physics(raw, batch["anchor_xy"], hp, batch["anchor_hp"] > 0)
+        cur_xy, cur_hp = current_xy_hp(batch["unit_features"])
+        clamped = clamp_physics(raw, cur_xy, hp, cur_hp > 0)
         ammo_anchor = batch["unit_features"][:, 0, :, 2] * MAX_AMMO
         ammo_final = (ammo_anchor - pred["dammo"][:, -1].clamp_min(0.0) * MAX_AMMO).clamp_min(0.0)
         for i, w in enumerate(chunk):

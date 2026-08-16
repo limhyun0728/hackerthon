@@ -405,8 +405,8 @@ def plan(
             raw_positions = assemble_positions(anchor_xy_t.unsqueeze(0).expand(b, -1, -1), dpos_future)
             hp_pred = assemble_hp(anchor_hp_t.unsqueeze(0).expand(b, -1), pred["ddmg"][:, 2:])
             clamped = clamp_physics(
-                raw_positions, anchor_xy_t.unsqueeze(0).expand(b, -1, -1),
-                hp_pred, (anchor_hp_t > 0).unsqueeze(0).expand(b, -1),
+                raw_positions, current_pos_t.unsqueeze(0).expand(b, -1, -1),
+                hp_pred, (current_hp_t > 0).unsqueeze(0).expand(b, -1),
             )
             ammo_final = (anchor_ammo_t.unsqueeze(0) - pred["dammo"][:, -1].clamp_min(0.0) * MAX_AMMO).clamp_min(0.0)
             result = score_candidates(

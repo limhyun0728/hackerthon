@@ -38,7 +38,7 @@ from wm2.model.features import (
 )
 from wm2.model.heads import WM2Heads
 from wm2.model.predictor import WM2Predictor
-from wm2.model.rollout import assemble_hp, assemble_positions, clamp_physics
+from wm2.model.rollout import assemble_hp, assemble_positions, clamp_physics, current_xy_hp
 from wm2.plan.cem import HORIZON, PlanCandidates, _action_tokens
 from wm2.plan.score import progress_batch
 from wm2.value.head import load_value_head
@@ -315,9 +315,10 @@ class Wm2Rollout:
                 pred = self.heads(pred_in["unit_tokens"], pred_in["mission_tokens"])
                 raw = assemble_positions(anchor_xy_t.unsqueeze(0).expand(b, -1, -1), pred["dpos"][:, 2:])
                 hp = assemble_hp(anchor_hp_t.unsqueeze(0).expand(b, -1), pred["ddmg"][:, 2:])
+                cur_xy, cur_hp = current_xy_hp(unit_t)
                 clamped = clamp_physics(
-                    raw, anchor_xy_t.unsqueeze(0).expand(b, -1, -1),
-                    hp, (anchor_hp_t > 0).unsqueeze(0).expand(b, -1),
+                    raw, cur_xy.unsqueeze(0).expand(b, -1, -1),
+                    hp, (cur_hp > 0).unsqueeze(0).expand(b, -1),
                 ).cpu().numpy()
                 hp_np = hp.cpu().numpy()
                 ammo_np = (
